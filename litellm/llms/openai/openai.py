@@ -1,6 +1,7 @@
 import time
 import types
 from typing import (
+    TYPE_CHECKING,
     Any,
     AsyncIterator,
     Callable,
@@ -10,7 +11,6 @@ from typing import (
     List,
     Literal,
     Optional,
-    TYPE_CHECKING,
     Union,
     cast,
 )
@@ -20,6 +20,7 @@ import httpx
 
 if TYPE_CHECKING:
     from aiohttp import ClientSession
+
 import openai
 from openai import AsyncOpenAI, OpenAI
 from openai.types.beta.assistant_deleted import AssistantDeleted
@@ -444,6 +445,11 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
             else:
                 headers = {}
             response = raw_response.parse()
+            if not data.get("stream") and not hasattr(response, "model_dump"):
+                raise OpenAIError(
+                    status_code=500,
+                    message=f"Empty or invalid response from LLM endpoint. Received: {response!r}. Check the reverse proxy or model server configuration.",
+                )
             return headers, response
         except openai.APITimeoutError as e:
             end_time = time.time()
@@ -477,7 +483,14 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
             else:
                 headers = {}
             response = raw_response.parse()
+            if not data.get("stream") and not hasattr(response, "model_dump"):
+                raise OpenAIError(
+                    status_code=500,
+                    message=f"Empty or invalid response from LLM endpoint. Received: {response!r}. Check the reverse proxy or model server configuration.",
+                )
             return headers, response
+        except OpenAIError:
+            raise
         except Exception as e:
             if raw_response is not None:
                 raise Exception(
@@ -542,9 +555,13 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
             provider_config: Optional[BaseConfig] = None
 
             if custom_llm_provider is not None and model is not None:
-                provider_config = ProviderConfigManager.get_provider_chat_config(
-                    model=model, provider=LlmProviders(custom_llm_provider)
-                )
+                try:
+                    provider_config = ProviderConfigManager.get_provider_chat_config(
+                        model=model, provider=LlmProviders(custom_llm_provider)
+                    )
+                except ValueError:
+                    # JSON-configured providers may not be in LlmProviders enum
+                    provider_config = None
 
             if provider_config is None:
                 provider_config = OpenAIConfig()
@@ -1537,7 +1554,7 @@ class OpenAIFilesAPI(BaseLLM):
         create_file_data: CreateFileRequest,
         openai_client: AsyncOpenAI,
     ) -> OpenAIFileObject:
-        response = await openai_client.files.create(**create_file_data)
+        response = await openai_client.files.create(**create_file_data)  # type: ignore[arg-type]
         return OpenAIFileObject(**response.model_dump())
 
     def create_file(
@@ -1573,7 +1590,7 @@ class OpenAIFilesAPI(BaseLLM):
             return self.acreate_file(  # type: ignore
                 create_file_data=create_file_data, openai_client=openai_client
             )
-        response = cast(OpenAI, openai_client).files.create(**create_file_data)
+        response = cast(OpenAI, openai_client).files.create(**create_file_data)  # type: ignore[arg-type]
         return OpenAIFileObject(**response.model_dump())
 
     async def afile_content(
@@ -1906,10 +1923,10 @@ class OpenAIBatchesAPI(BaseLLM):
         self,
         cancel_batch_data: CancelBatchRequest,
         openai_client: AsyncOpenAI,
-    ) -> Batch:
+    ) -> LiteLLMBatch:
         verbose_logger.debug("async cancelling batch, args= %s", cancel_batch_data)
         response = await openai_client.batches.cancel(**cancel_batch_data)
-        return response
+        return LiteLLMBatch(**response.model_dump())
 
     def cancel_batch(
         self,
@@ -1945,8 +1962,13 @@ class OpenAIBatchesAPI(BaseLLM):
                 cancel_batch_data=cancel_batch_data, openai_client=openai_client
             )
 
+        # At this point, openai_client is guaranteed to be a sync OpenAI client
+        if not isinstance(openai_client, OpenAI):
+            raise ValueError(
+                "OpenAI client is not an instance of OpenAI. Make sure you passed a sync OpenAI client."
+            )
         response = openai_client.batches.cancel(**cancel_batch_data)
-        return response
+        return LiteLLMBatch(**response.model_dump())
 
     async def alist_batches(
         self,

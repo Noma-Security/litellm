@@ -114,6 +114,27 @@ class LoggingCallbackManager:
         for c in remove_list:
             callback_list.remove(c)
 
+    def remove_callbacks_by_type(self, callback_list, callback_type):
+        """
+        Remove all callbacks of a specific type from a callback list.
+        
+        Args:
+            callback_list: The list to remove callbacks from (e.g., litellm.callbacks)
+            callback_type: The class type to match (e.g., SemanticToolFilterHook)
+            
+        Example:
+            litellm.logging_callback_manager.remove_callbacks_by_type(
+                litellm.callbacks, SemanticToolFilterHook
+            )
+        """
+        if not isinstance(callback_list, list):
+            return
+
+        remove_list = [c for c in callback_list if isinstance(c, callback_type)]
+
+        for c in remove_list:
+            callback_list.remove(c)
+
     def _add_string_callback_to_list(
         self, callback: str, parent_list: List[Union[CustomLogger, Callable, str]]
     ):
@@ -158,39 +179,60 @@ class LoggingCallbackManager:
         """
         callback_config = litellm.callback_settings.get(callback)
 
-        if not isinstance(callback_config, dict):
-            return callback
-
-        if callback_config.get("callback_type") != "generic_api":
-            return callback
-
-        endpoint = callback_config.get("endpoint")
-        headers = callback_config.get("headers")
-        event_types = callback_config.get("event_types")
-
-        if endpoint is None or headers is None:
-            verbose_logger.warning(
-                "generic_api callback '%s' is missing endpoint or headers, skipping.",
-                callback,
-            )
-            return callback
-
-        cached_logger = _generic_api_logger_cache.get(callback)
+        # Check if callback is in callback_settings with callback_type: generic_api
         if (
-            isinstance(cached_logger, GenericAPILogger)
-            and cached_logger.endpoint == endpoint
-            and cached_logger.headers == headers
-            and cached_logger.event_types == event_types
+            isinstance(callback_config, dict)
+            and callback_config.get("callback_type") == "generic_api"
         ):
-            return cached_logger
+            endpoint = callback_config.get("endpoint")
+            headers = callback_config.get("headers")
+            event_types = callback_config.get("event_types")
+            log_format = callback_config.get("log_format")
 
-        new_logger = GenericAPILogger(
-            endpoint=endpoint,
-            headers=headers,
-            event_types=event_types,
+            if endpoint is None or headers is None:
+                verbose_logger.warning(
+                    "generic_api callback '%s' is missing endpoint or headers, skipping.",
+                    callback,
+                )
+                return callback
+
+            cached_logger = _generic_api_logger_cache.get(callback)
+            if (
+                isinstance(cached_logger, GenericAPILogger)
+                and cached_logger.endpoint == endpoint
+                and cached_logger.headers == headers
+                and cached_logger.event_types == event_types
+                and cached_logger.log_format == log_format
+            ):
+                return cached_logger
+
+            new_logger = GenericAPILogger(
+                endpoint=endpoint,
+                headers=headers,
+                event_types=event_types,
+                log_format=log_format,
+            )
+            _generic_api_logger_cache[callback] = new_logger
+            return new_logger
+
+        # Check if callback is in generic_api_compatible_callbacks.json
+        from litellm.integrations.generic_api.generic_api_callback import (
+            is_callback_compatible,
         )
-        _generic_api_logger_cache[callback] = new_logger
-        return new_logger
+
+        if is_callback_compatible(callback):
+            # Check if we already have a cached logger for this callback
+            cached_logger = _generic_api_logger_cache.get(callback)
+            if isinstance(cached_logger, GenericAPILogger):
+                return cached_logger
+
+            # Create new GenericAPILogger with callback_name parameter
+            # This will load config from generic_api_compatible_callbacks.json
+            new_logger = GenericAPILogger(callback_name=callback)
+            _generic_api_logger_cache[callback] = new_logger
+            return new_logger
+
+        return callback
 
     def _safe_add_callback_to_list(
         self,
@@ -218,7 +260,6 @@ class LoggingCallbackManager:
                 callback=callback, parent_list=parent_list
             )
         elif isinstance(callback, CustomLogger):
-
             self._add_custom_logger_to_list(
                 custom_logger=callback,
                 parent_list=parent_list,

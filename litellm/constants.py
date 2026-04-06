@@ -1,4 +1,5 @@
 import os
+import sys
 from typing import List, Literal
 
 DEFAULT_HEALTH_CHECK_PROMPT = str(
@@ -47,16 +48,43 @@ DEFAULT_REPLICATE_POLLING_DELAY_SECONDS = int(
 DEFAULT_IMAGE_TOKEN_COUNT = int(os.getenv("DEFAULT_IMAGE_TOKEN_COUNT", 250))
 DEFAULT_IMAGE_WIDTH = int(os.getenv("DEFAULT_IMAGE_WIDTH", 300))
 DEFAULT_IMAGE_HEIGHT = int(os.getenv("DEFAULT_IMAGE_HEIGHT", 300))
+# Maximum size for image URL downloads in MB (default 50MB, set to 0 to disable limit)
+# This prevents memory issues from downloading very large images
+# Maps to OpenAI's 50 MB payload limit - requests with images exceeding this size will be rejected
+# Set MAX_IMAGE_URL_DOWNLOAD_SIZE_MB=0 to disable image URL handling entirely
+MAX_IMAGE_URL_DOWNLOAD_SIZE_MB = float(os.getenv("MAX_IMAGE_URL_DOWNLOAD_SIZE_MB", 50))
 MAX_SIZE_PER_ITEM_IN_MEMORY_CACHE_IN_KB = int(
     os.getenv("MAX_SIZE_PER_ITEM_IN_MEMORY_CACHE_IN_KB", 1024)
 )  # 1MB = 1024KB
 SINGLE_DEPLOYMENT_TRAFFIC_FAILURE_THRESHOLD = int(
     os.getenv("SINGLE_DEPLOYMENT_TRAFFIC_FAILURE_THRESHOLD", 1000)
 )  # Minimum number of requests to consider "reasonable traffic". Used for single-deployment cooldown logic.
+DEFAULT_FAILURE_THRESHOLD_MINIMUM_REQUESTS = int(
+    os.getenv("DEFAULT_FAILURE_THRESHOLD_MINIMUM_REQUESTS", 5)
+)  # Minimum number of requests before applying error rate cooldown. Prevents cooldown from triggering on first failure.
 
 DEFAULT_REASONING_EFFORT_DISABLE_THINKING_BUDGET = int(
     os.getenv("DEFAULT_REASONING_EFFORT_DISABLE_THINKING_BUDGET", 0)
 )
+
+# MCP Semantic Tool Filter Defaults
+DEFAULT_MCP_SEMANTIC_FILTER_EMBEDDING_MODEL = str(
+    os.getenv("DEFAULT_MCP_SEMANTIC_FILTER_EMBEDDING_MODEL", "text-embedding-3-small")
+)
+DEFAULT_MCP_SEMANTIC_FILTER_TOP_K = int(
+    os.getenv("DEFAULT_MCP_SEMANTIC_FILTER_TOP_K", 10)
+)
+DEFAULT_MCP_SEMANTIC_FILTER_SIMILARITY_THRESHOLD = float(
+    os.getenv("DEFAULT_MCP_SEMANTIC_FILTER_SIMILARITY_THRESHOLD", 0.3)
+)
+MAX_MCP_SEMANTIC_FILTER_TOOLS_HEADER_LENGTH = int(
+    os.getenv("MAX_MCP_SEMANTIC_FILTER_TOOLS_HEADER_LENGTH", 150)
+)
+
+LITELLM_UI_ALLOW_HEADERS = [
+    "x-litellm-semantic-filter",
+    "x-litellm-semantic-filter-tools",
+]
 
 # Gemini model-specific minimal thinking budget constants
 DEFAULT_REASONING_EFFORT_MINIMAL_THINKING_BUDGET_GEMINI_2_5_FLASH = int(
@@ -75,6 +103,9 @@ DEFAULT_REASONING_EFFORT_MINIMAL_THINKING_BUDGET_GEMINI_2_5_FLASH_LITE = int(
 DEFAULT_REASONING_EFFORT_MINIMAL_THINKING_BUDGET = int(
     os.getenv("DEFAULT_REASONING_EFFORT_MINIMAL_THINKING_BUDGET", 128)
 )
+
+# Provider-specific API base URLs
+XAI_API_BASE = "https://api.x.ai/v1"
 
 DEFAULT_REASONING_EFFORT_LOW_THINKING_BUDGET = int(
     os.getenv("DEFAULT_REASONING_EFFORT_LOW_THINKING_BUDGET", 1024)
@@ -99,10 +130,18 @@ RUNWAYML_POLLING_TIMEOUT = int(
 ########## Networking constants ##############################################################
 _DEFAULT_TTL_FOR_HTTPX_CLIENTS = 3600  # 1 hour, re-use the same httpx client for 1 hour
 
-# Aiohttp connection pooling constants
-AIOHTTP_CONNECTOR_LIMIT = int(os.getenv("AIOHTTP_CONNECTOR_LIMIT", 0))
+# Aiohttp connection pooling - prevents memory leaks from unbounded connection growth
+# Set to 0 for unlimited (not recommended for production)
+AIOHTTP_CONNECTOR_LIMIT = int(os.getenv("AIOHTTP_CONNECTOR_LIMIT", 300))
+AIOHTTP_CONNECTOR_LIMIT_PER_HOST = int(os.getenv("AIOHTTP_CONNECTOR_LIMIT_PER_HOST", 50))
 AIOHTTP_KEEPALIVE_TIMEOUT = int(os.getenv("AIOHTTP_KEEPALIVE_TIMEOUT", 120))
 AIOHTTP_TTL_DNS_CACHE = int(os.getenv("AIOHTTP_TTL_DNS_CACHE", 300))
+# enable_cleanup_closed is only needed for Python versions with the SSL leak bug
+# Fixed in Python 3.12.7+ and 3.13.1+ (see https://github.com/python/cpython/pull/118960)
+# Reference: https://github.com/aio-libs/aiohttp/blob/master/aiohttp/connector.py#L74-L78
+AIOHTTP_NEEDS_CLEANUP_CLOSED = (
+    (3, 13, 0) <= sys.version_info < (3, 13, 1) or sys.version_info < (3, 12, 7)
+)
 
 # WebSocket constants
 # Default to None (unlimited) to match OpenAI's official agents SDK behavior
@@ -140,9 +179,11 @@ REDIS_UPDATE_BUFFER_KEY = "litellm_spend_update_buffer"
 REDIS_DAILY_SPEND_UPDATE_BUFFER_KEY = "litellm_daily_spend_update_buffer"
 REDIS_DAILY_TEAM_SPEND_UPDATE_BUFFER_KEY = "litellm_daily_team_spend_update_buffer"
 REDIS_DAILY_ORG_SPEND_UPDATE_BUFFER_KEY = "litellm_daily_org_spend_update_buffer"
+REDIS_DAILY_END_USER_SPEND_UPDATE_BUFFER_KEY = "litellm_daily_end_user_spend_update_buffer"
+REDIS_DAILY_AGENT_SPEND_UPDATE_BUFFER_KEY = "litellm_daily_agent_spend_update_buffer"
 REDIS_DAILY_TAG_SPEND_UPDATE_BUFFER_KEY = "litellm_daily_tag_spend_update_buffer"
 MAX_REDIS_BUFFER_DEQUEUE_COUNT = int(os.getenv("MAX_REDIS_BUFFER_DEQUEUE_COUNT", 100))
-MAX_SIZE_IN_MEMORY_QUEUE = int(os.getenv("MAX_SIZE_IN_MEMORY_QUEUE", 10000))
+MAX_SIZE_IN_MEMORY_QUEUE = int(os.getenv("MAX_SIZE_IN_MEMORY_QUEUE", 2000))
 MAX_IN_MEMORY_QUEUE_FLUSH_COUNT = int(
     os.getenv("MAX_IN_MEMORY_QUEUE_FLUSH_COUNT", 1000)
 )
@@ -255,13 +296,32 @@ TOGETHER_AI_EMBEDDING_350_M = int(os.getenv("TOGETHER_AI_EMBEDDING_350_M", 350))
 QDRANT_SCALAR_QUANTILE = float(os.getenv("QDRANT_SCALAR_QUANTILE", 0.99))
 QDRANT_VECTOR_SIZE = int(os.getenv("QDRANT_VECTOR_SIZE", 1536))
 CACHED_STREAMING_CHUNK_DELAY = float(os.getenv("CACHED_STREAMING_CHUNK_DELAY", 0.02))
-AUDIO_SPEECH_CHUNK_SIZE = 8192  # chunk_size for audio speech streaming. Balance between latency and memory usage
+AUDIO_SPEECH_CHUNK_SIZE = int(
+    os.getenv("AUDIO_SPEECH_CHUNK_SIZE", 8192)
+)  # chunk_size for audio speech streaming. Balance between latency and memory usage
 MAX_SIZE_PER_ITEM_IN_MEMORY_CACHE_IN_KB = int(
     os.getenv("MAX_SIZE_PER_ITEM_IN_MEMORY_CACHE_IN_KB", 512)
 )
 DEFAULT_MAX_TOKENS_FOR_TRITON = int(os.getenv("DEFAULT_MAX_TOKENS_FOR_TRITON", 2000))
 #### Networking settings ####
 request_timeout: float = float(os.getenv("REQUEST_TIMEOUT", 6000))  # time in seconds
+DEFAULT_A2A_AGENT_TIMEOUT: float = float(os.getenv("DEFAULT_A2A_AGENT_TIMEOUT", 6000))  # 10 minutes
+# Patterns that indicate a localhost/internal URL in A2A agent cards that should be
+# replaced with the original base_url. This is a common misconfiguration where
+# developers deploy agents with development URLs in their agent cards.
+LOCALHOST_URL_PATTERNS: List[str] = [
+    "localhost",
+    "127.0.0.1",
+    "0.0.0.0",
+    "[::1]",  # IPv6 localhost
+]
+# Patterns in error messages that indicate a connection failure
+CONNECTION_ERROR_PATTERNS: List[str] = [
+    "connect",
+    "connection",
+    "network",
+    "refused",
+]
 STREAM_SSE_DONE_STRING: str = "[DONE]"
 STREAM_SSE_DATA_PREFIX: str = "data: "
 ### SPEND TRACKING ###
@@ -278,10 +338,16 @@ REDACTED_BY_LITELM_STRING = "REDACTED_BY_LITELM"
 MAX_LANGFUSE_INITIALIZED_CLIENTS = int(
     os.getenv("MAX_LANGFUSE_INITIALIZED_CLIENTS", 50)
 )
-LOGGING_WORKER_CONCURRENCY = int(os.getenv("LOGGING_WORKER_CONCURRENCY", 100)) # Must be above 0
+LOGGING_WORKER_CONCURRENCY = int(
+    os.getenv("LOGGING_WORKER_CONCURRENCY", 100)
+)  # Must be above 0
 LOGGING_WORKER_MAX_QUEUE_SIZE = int(os.getenv("LOGGING_WORKER_MAX_QUEUE_SIZE", 50_000))
-LOGGING_WORKER_MAX_TIME_PER_COROUTINE = float(os.getenv("LOGGING_WORKER_MAX_TIME_PER_COROUTINE", 20.0))
-LOGGING_WORKER_CLEAR_PERCENTAGE = int(os.getenv("LOGGING_WORKER_CLEAR_PERCENTAGE", 50))  # Percentage of queue to clear (default: 50%)
+LOGGING_WORKER_MAX_TIME_PER_COROUTINE = float(
+    os.getenv("LOGGING_WORKER_MAX_TIME_PER_COROUTINE", 20.0)
+)
+LOGGING_WORKER_CLEAR_PERCENTAGE = int(
+    os.getenv("LOGGING_WORKER_CLEAR_PERCENTAGE", 50)
+)  # Percentage of queue to clear (default: 50%)
 MAX_ITERATIONS_TO_CLEAR_QUEUE = int(os.getenv("MAX_ITERATIONS_TO_CLEAR_QUEUE", 200))
 MAX_TIME_TO_CLEAR_QUEUE = float(os.getenv("MAX_TIME_TO_CLEAR_QUEUE", 5.0))
 LOGGING_WORKER_AGGRESSIVE_CLEAR_COOLDOWN_SECONDS = float(
@@ -291,14 +357,24 @@ DD_TRACER_STREAMING_CHUNK_YIELD_RESOURCE = os.getenv(
     "DD_TRACER_STREAMING_CHUNK_YIELD_RESOURCE", "streaming.chunk.yield"
 )
 
+EMAIL_BUDGET_ALERT_TTL = int(os.getenv("EMAIL_BUDGET_ALERT_TTL", 24 * 60 * 60))  # 24 hours in seconds
+EMAIL_BUDGET_ALERT_MAX_SPEND_ALERT_PERCENTAGE = float(os.getenv("EMAIL_BUDGET_ALERT_MAX_SPEND_ALERT_PERCENTAGE", 0.8))  # 80% of max budget
 ############### LLM Provider Constants ###############
 ### ANTHROPIC CONSTANTS ###
+ANTHROPIC_TOKEN_COUNTING_BETA_VERSION = os.getenv(
+    "ANTHROPIC_TOKEN_COUNTING_BETA_VERSION", "token-counting-2024-11-01"
+)
 ANTHROPIC_SKILLS_API_BETA_VERSION = "skills-2025-10-02"
 ANTHROPIC_WEB_SEARCH_TOOL_MAX_USES = {
     "low": 1,
     "medium": 5,
     "high": 10,
 }
+
+# LiteLLM standard web search tool name
+# Used for web search interception across providers
+LITELLM_WEB_SEARCH_TOOL_NAME = "litellm_web_search"
+
 DEFAULT_IMAGE_ENDPOINT_MODEL = "dall-e-2"
 DEFAULT_VIDEO_ENDPOINT_MODEL = "sora-2"
 
@@ -327,6 +403,7 @@ LITELLM_CHAT_PROVIDERS = [
     "huggingface",
     "together_ai",
     "datarobot",
+    "helicone",
     "openrouter",
     "cometapi",
     "vertex_ai",
@@ -350,6 +427,7 @@ LITELLM_CHAT_PROVIDERS = [
     "perplexity",
     "mistral",
     "groq",
+    "gigachat",
     "nvidia_nim",
     "cerebras",
     "baseten",
@@ -378,6 +456,7 @@ LITELLM_CHAT_PROVIDERS = [
     "galadriel",
     "gradient_ai",
     "github_copilot",  # GitHub Copilot Chat API
+    "chatgpt",  # ChatGPT subscription API
     "novita",
     "meta_llama",
     "featherless_ai",
@@ -396,6 +475,7 @@ LITELLM_CHAT_PROVIDERS = [
     "ovhcloud",
     "lemonade",
     "docker_model_runner",
+    "amazon_nova",
 ]
 
 LITELLM_EMBEDDING_PROVIDERS_SUPPORTING_INPUT_ARRAY_OF_TOKENS = [
@@ -504,6 +584,10 @@ DEFAULT_CHAT_COMPLETION_PARAM_VALUES = {
     "web_search_options": None,
     "service_tier": None,
     "safety_identifier": None,
+    "prompt_cache_key": None,
+    "prompt_cache_retention": None,
+    "store": None,
+    "metadata": None,
 }
 
 openai_compatible_endpoints: List = [
@@ -521,6 +605,7 @@ openai_compatible_endpoints: List = [
     "https://api.friendli.ai/serverless/v1",
     "api.sambanova.ai/v1",
     "api.x.ai/v1",
+    "ollama.com",
     "api.galadriel.ai/v1",
     "api.llama.com/compat/v1/",
     "api.featherless.ai/v1",
@@ -528,11 +613,17 @@ openai_compatible_endpoints: List = [
     "api.studio.nebius.ai/v1",
     "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
     "https://api.moonshot.ai/v1",
-    "https://platform.publicai.co/v1",
+    "https://api.publicai.co/v1",
+    "https://api.synthetic.new/openai/v1",
+    "https://api.stima.tech/v1",
+    "https://nano-gpt.com/api/v1",
+    "https://api.poe.com/v1",
+    "https://llm.chutes.ai/v1/",
     "https://api.v0.dev/v1",
     "https://api.morphllm.com/v1",
     "https://api.lambda.ai/v1",
     "https://api.hyperbolic.xyz/v1",
+    "https://ai-gateway.helicone.ai/",
     "https://ai-gateway.vercel.sh/v1",
     "https://api.inference.wandb.ai/v1",
     "https://api.clarifai.com/v2/ext/openai/v1",
@@ -555,6 +646,7 @@ openai_compatible_providers: List = [
     "perplexity",
     "xinference",
     "xai",
+    "zai",
     "together_ai",
     "fireworks_ai",
     "empower",
@@ -567,15 +659,22 @@ openai_compatible_providers: List = [
     "lm_studio",
     "galadriel",
     "github_copilot",  # GitHub Copilot Chat API
+    "chatgpt",  # ChatGPT subscription API
     "novita",
     "meta_llama",
+    "publicai",  # PublicAI - JSON-configured provider
+    "synthetic",  # Synthetic - JSON-configured provider
+    "apertis",  # Apertis - JSON-configured provider
+    "nano-gpt",  # Nano-GPT - JSON-configured provider
+    "poe",  # Poe - JSON-configured provider
+    "chutes",  # Chutes - JSON-configured provider
     "featherless_ai",
     "nscale",
     "nebius",
     "dashscope",
     "moonshot",
-    "publicai",
     "v0",
+    "helicone",
     "morph",
     "lambda_ai",
     "hyperbolic",
@@ -585,6 +684,7 @@ openai_compatible_providers: List = [
     "cometapi",
     "clarifai",
     "docker_model_runner",
+    "ragflow",
 ]
 openai_text_completion_compatible_providers: List = (
     [  # providers that support `/v1/completions`
@@ -598,6 +698,11 @@ openai_text_completion_compatible_providers: List = (
         "dashscope",
         "moonshot",
         "publicai",
+        "synthetic",
+        "apertis",
+        "nano-gpt",
+        "poe",
+        "chutes",
         "v0",
         "lambda_ai",
         "hyperbolic",
@@ -857,7 +962,11 @@ BEDROCK_INVOKE_PROVIDERS_LITERAL = Literal[
     "nova",
     "deepseek_r1",
     "qwen3",
+    "qwen2",
     "twelvelabs",
+    "openai",
+    "stability",
+    "moonshot",
 ]
 
 BEDROCK_EMBEDDING_PROVIDERS_LITERAL = Literal[
@@ -877,6 +986,8 @@ BEDROCK_CONVERSE_MODELS = [
     "openai.gpt-oss-120b-1:0",
     "anthropic.claude-haiku-4-5-20251001-v1:0",
     "anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "anthropic.claude-opus-4-6-v1:0",
+    "anthropic.claude-opus-4-6-v1",
     "anthropic.claude-opus-4-1-20250805-v1:0",
     "anthropic.claude-opus-4-20250514-v1:0",
     "anthropic.claude-sonnet-4-20250514-v1:0",
@@ -907,6 +1018,12 @@ BEDROCK_CONVERSE_MODELS = [
     "meta.llama3-2-3b-instruct-v1:0",
     "meta.llama3-2-11b-instruct-v1:0",
     "meta.llama3-2-90b-instruct-v1:0",
+    "amazon.nova-lite-v1:0",
+    "amazon.nova-2-lite-v1:0",
+    "amazon.nova-2-pro-preview-20251202-v1:0",
+    "amazon.nova-pro-v1:0",
+    "writer.palmyra-x4-v1:0",
+    "writer.palmyra-x5-v1:0",
 ]
 
 
@@ -991,7 +1108,7 @@ known_tokenizer_config = {
 }
 
 
-OPENAI_FINISH_REASONS = ["stop", "length", "function_call", "content_filter", "null"]
+OPENAI_FINISH_REASONS = ["stop", "length", "function_call", "content_filter", "null", "finish_reason_unspecified", "malformed_function_call", "guardrail_intervened", "eos"]
 HUMANLOOP_PROMPT_CACHE_TTL_SECONDS = int(
     os.getenv("HUMANLOOP_PROMPT_CACHE_TTL_SECONDS", 60)
 )  # 1 minute
@@ -1016,6 +1133,13 @@ LITELLM_TRUNCATED_PAYLOAD_FIELD = "litellm_truncated"
 
 ########################### LiteLLM Proxy Specific Constants ###########################
 ########################################################################################
+
+# Standard headers that are always checked for customer/end-user ID (no configuration required)
+# These headers work out-of-the-box for tools like Claude Code that support custom headers
+STANDARD_CUSTOMER_ID_HEADERS = [
+    "x-litellm-customer-id",
+    "x-litellm-end-user-id",
+]
 MAX_SPENDLOG_ROWS_TO_QUERY = int(
     os.getenv("MAX_SPENDLOG_ROWS_TO_QUERY", 1_000_000)
 )  # if spendLogs has more than 1M rows, do not query the DB
@@ -1039,6 +1163,20 @@ BEDROCK_AGENT_RUNTIME_PASS_THROUGH_ROUTES = [
     "generateQuery/",
     "optimize-prompt/",
 ]
+
+
+# Headers that are safe to forward from incoming requests to Vertex AI
+# Using an allowlist approach for security - only forward headers we explicitly trust
+ALLOWED_VERTEX_AI_PASSTHROUGH_HEADERS = {
+    "anthropic-beta",  # Required for Anthropic features like extended context windows
+    "content-type",  # Required for request body parsing
+}
+
+# Prefix for headers that should be forwarded to the provider with the prefix stripped
+# e.g., 'x-pass-anthropic-beta: value' becomes 'anthropic-beta: value'
+# Works for all LLM pass-through endpoints (Vertex AI, Anthropic, Bedrock, etc.)
+PASS_THROUGH_HEADER_PREFIX = "x-pass-"
+
 BASE_MCP_ROUTE = "/mcp"
 
 BATCH_STATUS_POLL_INTERVAL_SECONDS = int(
@@ -1068,6 +1206,12 @@ LITELLM_CLI_SOURCE_IDENTIFIER = "litellm-cli"
 LITELLM_CLI_SESSION_TOKEN_PREFIX = "litellm-session-token"
 CLI_SSO_SESSION_CACHE_KEY_PREFIX = "cli_sso_session"
 CLI_JWT_TOKEN_NAME = "cli-jwt-token"
+# Support both CLI_JWT_EXPIRATION_HOURS and LITELLM_CLI_JWT_EXPIRATION_HOURS for backwards compatibility
+CLI_JWT_EXPIRATION_HOURS = int(
+    os.getenv("CLI_JWT_EXPIRATION_HOURS") 
+    or os.getenv("LITELLM_CLI_JWT_EXPIRATION_HOURS") 
+    or 24
+)
 
 ########################### DB CRON JOB NAMES ###########################
 DB_SPEND_UPDATE_JOB_NAME = "db_spend_update_job"
@@ -1079,6 +1223,8 @@ CLOUDZERO_MAX_FETCHED_DATA_RECORDS = int(
 SPEND_LOG_CLEANUP_JOB_NAME = "spend_log_cleanup"
 SPEND_LOG_RUN_LOOPS = int(os.getenv("SPEND_LOG_RUN_LOOPS", 500))
 SPEND_LOG_CLEANUP_BATCH_SIZE = int(os.getenv("SPEND_LOG_CLEANUP_BATCH_SIZE", 1000))
+SPEND_LOG_QUEUE_SIZE_THRESHOLD = int(os.getenv("SPEND_LOG_QUEUE_SIZE_THRESHOLD", 100))
+SPEND_LOG_QUEUE_POLL_INTERVAL = float(os.getenv("SPEND_LOG_QUEUE_POLL_INTERVAL", 2.0))
 DEFAULT_CRON_JOB_LOCK_TTL_SECONDS = int(
     os.getenv("DEFAULT_CRON_JOB_LOCK_TTL_SECONDS", 60)
 )  # 1 minute
@@ -1144,6 +1290,8 @@ LITELLM_SETTINGS_SAFE_DB_OVERRIDES = [
     "public_agent_groups",
     "public_model_groups",
     "public_model_groups_links",
+    "cost_discount_config",
+    "cost_margin_config",
 ]
 SPECIAL_LITELLM_AUTH_TOKEN = ["ui-token"]
 DEFAULT_MANAGEMENT_OBJECT_IN_MEMORY_CACHE_TTL = int(
@@ -1224,3 +1372,27 @@ COROUTINE_CHECKER_MAX_SIZE_IN_MEMORY = int(
 ########################### RAG Text Splitter Constants ###########################
 DEFAULT_CHUNK_SIZE = int(os.getenv("DEFAULT_CHUNK_SIZE", 1000))
 DEFAULT_CHUNK_OVERLAP = int(os.getenv("DEFAULT_CHUNK_OVERLAP", 200))
+
+########################### S3 Vectors RAG Constants ###########################
+S3_VECTORS_DEFAULT_DIMENSION = int(os.getenv("S3_VECTORS_DEFAULT_DIMENSION", 1024))
+S3_VECTORS_DEFAULT_DISTANCE_METRIC = str(
+    os.getenv("S3_VECTORS_DEFAULT_DISTANCE_METRIC", "cosine")
+)
+S3_VECTORS_DEFAULT_NON_FILTERABLE_METADATA_KEYS = ["source_text"]
+
+########################### Microsoft SSO Constants ###########################
+MICROSOFT_USER_EMAIL_ATTRIBUTE = str(
+    os.getenv("MICROSOFT_USER_EMAIL_ATTRIBUTE", "userPrincipalName")
+)
+MICROSOFT_USER_DISPLAY_NAME_ATTRIBUTE = str(
+    os.getenv("MICROSOFT_USER_DISPLAY_NAME_ATTRIBUTE", "displayName")
+)
+MICROSOFT_USER_ID_ATTRIBUTE = str(
+    os.getenv("MICROSOFT_USER_ID_ATTRIBUTE", "id")
+)
+MICROSOFT_USER_FIRST_NAME_ATTRIBUTE = str(
+    os.getenv("MICROSOFT_USER_FIRST_NAME_ATTRIBUTE", "givenName")
+)
+MICROSOFT_USER_LAST_NAME_ATTRIBUTE = str(
+    os.getenv("MICROSOFT_USER_LAST_NAME_ATTRIBUTE", "surname")
+)

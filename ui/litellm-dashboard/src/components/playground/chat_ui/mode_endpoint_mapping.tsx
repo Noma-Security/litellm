@@ -25,6 +25,8 @@ export enum EndpointType {
   EMBEDDINGS = "embeddings",
   SPEECH = "speech",
   TRANSCRIPTION = "transcription",
+  A2A_AGENTS = "a2a_agents",
+  MCP = "mcp",
   // add additional endpoint types if required
 }
 

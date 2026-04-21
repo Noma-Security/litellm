@@ -36,7 +36,6 @@ _DEFAULT_API_BASE = "https://api.noma.security/"
 _AIDR_SCAN_ENDPOINT = "/litellm/guardrail"
 _INTERVENED_INPUT_FIELDS = ("texts", "images", "tools", "tool_calls")
 _DEFAULT_API_BASE_HOSTNAME = urlparse(_DEFAULT_API_BASE).hostname
-_DEFAULT_APPLICATION_ID = "litellm"
 
 
 class _Action(str, enum.Enum):
@@ -132,97 +131,28 @@ class NomaV2Guardrail(CustomGuardrail):
 
         raise ValueError("Noma v2 response missing valid action")
 
-    @staticmethod
-    def _get_request_metadata(request_data: dict) -> dict[str, Any]:
-        metadata = request_data.get("metadata")
-        if isinstance(metadata, dict):
-            return metadata
-        return {}
-
-    def _resolve_context_application_id(
-        self,
-        request_data: dict,
-        dynamic_application_id: Optional[str],
-    ) -> str:
-        metadata = self._get_request_metadata(request_data)
-        headers = metadata.get("headers")
-        if not isinstance(headers, dict):
-            headers = {}
-
-        header_application_id = self._get_non_empty_str(
-            headers.get("x-noma-application-id")
-        )
-        key_alias = self._get_non_empty_str(
-            metadata.get("user_api_key_alias")
-        )
-
-        return (
-            dynamic_application_id
-            or header_application_id
-            or self._get_non_empty_str(self.application_id)
-            or key_alias
-            or _DEFAULT_APPLICATION_ID
-        )
-
-    def _resolve_context_user_id(self, request_data: dict) -> Optional[str]:
-        metadata = self._get_request_metadata(request_data)
-        user_email = self._get_non_empty_str(metadata.get("user_api_key_user_email"))
-        user_id = self._get_non_empty_str(metadata.get("user_api_key_user_id"))
-        return user_email or user_id
-
-    def _resolve_context_request_id(self, request_data: dict) -> Optional[str]:
-        response = request_data.get("response")
-        if isinstance(response, dict):
-            return self._get_non_empty_str(response.get("id"))
-
-        return self._get_non_empty_str(getattr(response, "id", None))
-
-    def _build_x_noma_context(
-        self,
-        request_data: dict,
-        dynamic_application_id: Optional[str],
-    ) -> dict[str, Optional[str]]:
-        metadata = self._get_request_metadata(request_data)
-        return {
-            "applicationId": self._resolve_context_application_id(
-                request_data=request_data,
-                dynamic_application_id=dynamic_application_id,
-            ),
-            "ipAddress": self._get_non_empty_str(metadata.get("requester_ip_address")),
-            "userId": self._resolve_context_user_id(request_data=request_data),
-            "sessionId": self._get_non_empty_str(request_data.get("litellm_call_id")),
-            "requestId": self._resolve_context_request_id(request_data=request_data),
-        }
-
     def _build_scan_payload(
         self,
         inputs: GenericGuardrailAPIInputs,
         request_data: dict,
         input_type: Literal["request", "response"],
         logging_obj: Optional["LiteLLMLoggingObj"],
-        dynamic_application_id: Optional[str] = None,
+        application_id: Optional[str],
     ) -> dict:
         payload_request_data = deepcopy(request_data)
         if logging_obj is not None:
             payload_request_data["litellm_logging_obj"] = getattr(
                 logging_obj, "model_call_details", None
             )
-        resolved_application_id = self._resolve_context_application_id(
-            request_data=request_data,
-            dynamic_application_id=dynamic_application_id,
-        )
 
         payload: dict[str, Any] = {
             "inputs": inputs,
             "request_data": payload_request_data,
             "input_type": input_type,
             "monitor_mode": self.monitor_mode,
-            "x-noma-context": self._build_x_noma_context(
-                request_data=request_data,
-                dynamic_application_id=dynamic_application_id,
-            ),
-            "application_id": resolved_application_id,
         }
+        if application_id:
+            payload["application_id"] = application_id
         return payload
 
     @staticmethod
@@ -338,9 +268,11 @@ class NomaV2Guardrail(CustomGuardrail):
             dynamic_params = {}
         response_json: Optional[dict] = None
 
-        dynamic_application_id = self._get_non_empty_str(
-            dynamic_params.get("application_id")
-        )
+        # Per-request dynamic params can override configured application context.
+        application_id = self._get_non_empty_str(dynamic_params.get("application_id"))
+
+        if application_id is None:
+            application_id = self._get_non_empty_str(self.application_id)
 
         try:
             payload = self._build_scan_payload(
@@ -348,7 +280,7 @@ class NomaV2Guardrail(CustomGuardrail):
                 request_data=request_data,
                 input_type=input_type,
                 logging_obj=logging_obj,
-                dynamic_application_id=dynamic_application_id,
+                application_id=application_id,
             )
 
             response_json = await self._call_noma_scan(payload=payload)

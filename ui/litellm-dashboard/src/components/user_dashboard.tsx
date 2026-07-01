@@ -1,7 +1,6 @@
 "use client";
 import { clearTokenCookies, getCookie } from "@/utils/cookieUtils";
 import { Col, Grid } from "@tremor/react";
-import { Typography } from "antd";
 import { jwtDecode } from "jwt-decode";
 import { useSearchParams } from "next/navigation";
 import React, { useEffect, useState } from "react";
@@ -46,7 +45,6 @@ interface UserDashboardProps {
   setTeams: React.Dispatch<React.SetStateAction<Team[] | null>>;
   setKeys: (keys: KeyResponse[]) => void;
   premiumUser: boolean;
-  organizations: Organization[] | null;
   addKey: (data: any) => void;
   createClicked: boolean;
   autoOpenCreate?: boolean;
@@ -70,7 +68,6 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
   setTeams,
   setKeys,
   premiumUser,
-  organizations,
   addKey,
   createClicked,
   autoOpenCreate,
@@ -317,15 +314,10 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
     setUserRole("App Owner");
   }
 
-  if (userRole && userRole == "Admin Viewer") {
-    const { Title, Paragraph } = Typography;
-    return (
-      <div>
-        <Title level={1}>Access Denied</Title>
-        <Paragraph>Ask your proxy admin for access to create keys</Paragraph>
-      </div>
-    );
-  }
+  // Admin Viewer can view keys read-only — gate "Create Key" but render the
+  // virtual-keys table the same as for Proxy Admin (read parity). Every
+  // other role keeps its existing ability to create keys.
+  const canCreateKey = userRole !== "Admin Viewer" && userRole !== "proxy_admin_viewer";
 
   console.log("inside user dashboard, selected team", selectedTeam);
   console.log("All cookies after redirect:", document.cookie);
@@ -333,16 +325,18 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
     <div className="w-full mx-4 h-[75vh]">
       <Grid numItems={1} className="gap-2 p-8 w-full mt-2">
         <Col numColSpan={1} className="flex flex-col gap-2">
-          <CreateKey
-            key={selectedTeam ? selectedTeam.team_id : null}
-            team={selectedTeam as Team | null}
-            teams={teams as Team[]}
-            data={keys}
-            addKey={addKey}
-            autoOpenCreate={autoOpenCreate}
-            prefillData={prefillData}
-          />
-          <VirtualKeysTable teams={teams} organizations={organizations} />
+          {canCreateKey && (
+            <CreateKey
+              key={selectedTeam ? selectedTeam.team_id : null}
+              team={selectedTeam as Team | null}
+              teams={teams as Team[]}
+              data={keys}
+              addKey={addKey}
+              autoOpenCreate={autoOpenCreate}
+              prefillData={prefillData}
+            />
+          )}
+          <VirtualKeysTable />
         </Col>
       </Grid>
     </div>

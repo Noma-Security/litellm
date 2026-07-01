@@ -6,7 +6,9 @@ import {
   guardrailLogoMap,
   getGuardrailProviders,
   type SkipSystemMessageChoice,
+  type SkipToolMessageChoice,
 } from "./guardrail_info_helpers";
+import { resolveLogoSrc } from "@/lib/assetPaths";
 import { getGuardrailUISettings, getGlobalLitellmHeaderName } from "../networking";
 import PiiConfiguration from "./pii_configuration";
 import NotificationsManager from "../molecules/notifications_manager";
@@ -29,6 +31,7 @@ interface EditGuardrailFormProps {
     default_on: boolean;
     pii_entities_config?: { [key: string]: string };
     skip_system_message_choice?: SkipSystemMessageChoice;
+    skip_tool_message_choice?: SkipToolMessageChoice;
     [key: string]: any;
   };
 }
@@ -136,6 +139,15 @@ const EditGuardrailForm: React.FC<EditGuardrailFormProps> = ({
         litellm_params.skip_system_message_in_guardrail = false;
       } else {
         delete litellm_params.skip_system_message_in_guardrail;
+      }
+
+      const skipToolChoice = values.skip_tool_message_choice as SkipToolMessageChoice | undefined;
+      if (skipToolChoice === "yes") {
+        litellm_params.skip_tool_message_in_guardrail = true;
+      } else if (skipToolChoice === "no") {
+        litellm_params.skip_tool_message_in_guardrail = false;
+      } else {
+        delete litellm_params.skip_tool_message_in_guardrail;
       }
 
       let guardrail_info: any = {};
@@ -290,6 +302,17 @@ const EditGuardrailForm: React.FC<EditGuardrailFormProps> = ({
             />
           </Form.Item>
         );
+      case "CatoNetworks":
+        return (
+          <Form.Item label="Cato Networks Configuration" name="config" tooltip="JSON configuration for Cato Networks">
+            <Input.TextArea
+              rows={4}
+              placeholder={`{
+  "api_key": "your_cato_api_key"
+}`}
+            />
+          </Form.Item>
+        );
       case "GuardrailsAI":
         return (
           <Form.Item label="Guardrails.ai Configuration" name="config" tooltip="JSON configuration for Guardrails.ai">
@@ -370,7 +393,7 @@ const EditGuardrailForm: React.FC<EditGuardrailFormProps> = ({
                 <div style={{ display: "flex", alignItems: "center" }}>
                   {guardrailLogoMap[value] && (
                     <img
-                      src={guardrailLogoMap[value]}
+                      src={resolveLogoSrc(guardrailLogoMap[value])}
                       alt=""
                       style={{
                         height: "20px",
@@ -424,6 +447,18 @@ const EditGuardrailForm: React.FC<EditGuardrailFormProps> = ({
           name="skip_system_message_choice"
           label="Skip system messages in guardrail"
           tooltip="Unified guardrails only: whether role: system content is omitted from guardrail input (LLM still receives full messages). Use global default follows litellm_settings.skip_system_message_in_guardrail."
+        >
+          <Select>
+            <Option value="inherit">Use global default</Option>
+            <Option value="yes">Yes — exclude from guardrail scan</Option>
+            <Option value="no">No — always include in scan</Option>
+          </Select>
+        </Form.Item>
+
+        <Form.Item
+          name="skip_tool_message_choice"
+          label="Skip tool messages in guardrail"
+          tooltip="Unified guardrails only: whether role: tool content is omitted from guardrail input (LLM still receives full messages). Use global default follows litellm_settings.skip_tool_message_in_guardrail."
         >
           <Select>
             <Option value="inherit">Use global default</Option>

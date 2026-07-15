@@ -436,3 +436,31 @@ def test_convert_cached_responses_legacy_stream_path():
     )
 
     assert isinstance(result, CachedResponsesAPIStreamingIterator)
+
+
+def test_request_kwargs_does_not_retain_logging_obj():
+    """
+    The caching handler lives on logging_obj._llm_caching_handler, so keeping
+    litellm_logging_obj inside request_kwargs closes a reference cycle
+    (Logging -> LLMCachingHandler -> kwargs -> Logging). That cycle keeps the
+    full request payload alive until a generational GC pass instead of being
+    freed by refcount when the request finishes; under bursts of large-token
+    requests this presents as stepwise RSS growth that never returns to
+    baseline. Other kwargs (messages included) must be preserved.
+    """
+    logging_obj = MagicMock()
+    kwargs = {
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hello"}],
+        "litellm_logging_obj": logging_obj,
+    }
+
+    handler = LLMCachingHandler(
+        original_function=MagicMock(),
+        request_kwargs=kwargs,
+        start_time=datetime.now(),
+    )
+
+    assert "litellm_logging_obj" not in handler.request_kwargs
+    assert handler.request_kwargs["messages"] == kwargs["messages"]
+    assert handler.request_kwargs["model"] == "gpt-4o"

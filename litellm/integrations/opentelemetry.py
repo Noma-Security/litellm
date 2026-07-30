@@ -1336,37 +1336,41 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
 
         std_log = kwargs.get("standard_logging_object")
         md = getattr(std_log, "metadata", None) or (std_log or {}).get("metadata", {})
-        for key in [
+        # Only values bounded by configured entities (keys, teams, orgs) belong on a
+        # metric. The SDK stores one aggregation per unique attribute set and never
+        # frees it - opentelemetry-sdk 1.28 implements no cardinality limit - so an
+        # attribute that varies per request (end-user id, caller IP, request headers,
+        # cost) grows the meter provider without bound for the life of the process.
+        # Dropping them at the collector does not help: the aggregations are already
+        # allocated in-process before export.
+        # This list is the complement of the collector's transform/litellm_genai
+        # delete_key set: everything it strips before export is omitted here, and
+        # everything it forwards is kept, so exported series are unchanged.
+        for key in (
             "user_api_key_hash",
             "user_api_key_alias",
             "user_api_key_team_id",
-            "user_api_key_org_id",
-            "user_api_key_user_id",
             "user_api_key_team_alias",
-            "user_api_key_user_email",
-            "spend_logs_metadata",
-            "requester_ip_address",
-            "requester_metadata",
-            "user_api_key_end_user_id",
-            "prompt_management_metadata",
+            "user_api_key_org_id",
             "applied_guardrails",
-            "mcp_tool_call_metadata",
-            "vector_store_request_metadata",
-        ]:
+        ):
             value = md.get(key)
             if value is None:
                 continue
-            if isinstance(value, (dict, list)):
-                common_attrs[f"metadata.{key}"] = safe_dumps(value)
-            else:
-                common_attrs[f"metadata.{key}"] = str(value)
+            common_attrs[f"metadata.{key}"] = (
+                safe_dumps(value) if isinstance(value, (dict, list)) else str(value)
+            )
 
-        # get hidden params
-        hidden_params = getattr(std_log, "hidden_params", None) or (std_log or {}).get(
-            "hidden_params", {}
-        )
-        if hidden_params:
-            common_attrs["hidden_params"] = safe_dumps(hidden_params)
+        # requester_metadata is a dict of the caller's headers, and traceparent is
+        # unique per request, so lift only the two grouping fields off it. These are
+        # deliberately unprefixed: the collector used to derive "component"/"platform"
+        # from the raw dict, and consumers group by those names.
+        requester_metadata = md.get("requester_metadata")
+        if isinstance(requester_metadata, dict):
+            for key in ("component", "platform"):
+                value = requester_metadata.get(key)
+                if value is not None:
+                    common_attrs[key] = str(value)
 
         if self._operation_duration_histogram:
             self._operation_duration_histogram.record(

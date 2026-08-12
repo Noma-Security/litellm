@@ -7,6 +7,7 @@
 import enum
 import json
 import os
+from collections.abc import Mapping
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Final, Literal, Optional, cast
 from urllib.parse import urlparse
@@ -141,10 +142,12 @@ class NomaV2Guardrail(CustomGuardrail):
             self._without_duplicated_conversation(request_data)
         )
         if logging_obj is not None:
-            model_call_details = getattr(logging_obj, "model_call_details", None)
-            if isinstance(model_call_details, dict):
-                model_call_details = self._without_duplicated_conversation(model_call_details)
-            payload_request_data["litellm_logging_obj"] = model_call_details
+            model_call_details: Final = getattr(logging_obj, "model_call_details", None)
+            payload_request_data["litellm_logging_obj"] = (
+                self._without_duplicated_conversation(model_call_details)
+                if isinstance(model_call_details, dict)
+                else model_call_details
+            )
 
         payload: Final[dict[str, Any]] = {
             "inputs": inputs,
@@ -157,8 +160,10 @@ class NomaV2Guardrail(CustomGuardrail):
         return payload
 
     @staticmethod
-    def _without_duplicated_conversation(data: dict) -> dict:
-        return {key: value for key, value in data.items() if key not in _DUPLICATED_CONVERSATION_KEYS}
+    def _without_duplicated_conversation(data: Mapping[str, Any]) -> dict[str, Any]:  # mutable-ok: handed to _sanitize_payload_for_transport, which takes a dict
+        return {  # mutable-ok: same - the trimmed copy is the sanitizer's input
+            key: value for key, value in data.items() if key not in _DUPLICATED_CONVERSATION_KEYS
+        }
 
     @staticmethod
     def _sanitize_payload_for_transport(payload: dict) -> dict:

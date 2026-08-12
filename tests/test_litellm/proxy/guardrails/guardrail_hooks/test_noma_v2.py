@@ -129,13 +129,50 @@ class TestNomaV2Configuration:
         )
 
         assert payload["inputs"] == inputs
-        assert payload["request_data"] == request_data
+        # Everything except the duplicated conversation is forwarded untouched, so a scanner-side
+        # change that starts reading a new request_data key needs no hook release.
+        assert payload["request_data"] == {
+            key: value for key, value in request_data.items() if key != "messages"
+        }
         assert payload["input_type"] == "request"
         assert payload["monitor_mode"] is False
         assert payload["application_id"] == "dynamic-app"
         assert "dynamic_params" not in payload
         assert "x-noma-context" not in payload
         assert "input" not in payload
+
+    def test_build_scan_payload_drops_conversation_duplicated_in_request_data(
+        self, noma_v2_guardrail
+    ):
+        """The scan reads the conversation from `inputs`; repeating it in `request_data` uploaded
+        the whole thing - base64 images included - a second time."""
+        inputs = {"texts": ["hello"]}
+        request_data = {
+            "messages": [{"role": "user", "content": "hello"}],
+            "input": [{"role": "user", "content": "hello"}],
+            "metadata": {"headers": {"x-noma-application-id": "header-app"}},
+            "litellm_call_id": "call-id-1",
+            "stream": True,
+        }
+
+        payload = noma_v2_guardrail._build_scan_payload(
+            inputs=inputs,
+            request_data=request_data,
+            input_type="request",
+            logging_obj=None,
+            application_id="dynamic-app",
+        )
+
+        assert "messages" not in payload["request_data"]
+        assert "input" not in payload["request_data"]
+        # Keys the scanner reads for context must survive.
+        assert payload["request_data"]["metadata"] == request_data["metadata"]
+        assert payload["request_data"]["litellm_call_id"] == "call-id-1"
+        assert payload["request_data"]["stream"] is True
+        # The conversation still reaches the scanner through `inputs`.
+        assert payload["inputs"] == inputs
+        # The caller's dict is untouched.
+        assert "messages" in request_data
 
     def test_build_scan_payload_deep_copies_request_data(self, noma_v2_guardrail):
         request_data = {
@@ -153,11 +190,11 @@ class TestNomaV2Configuration:
         payload["request_data"]["metadata"]["headers"][
             "x-noma-application-id"
         ] = "mutated-value"
-        payload["request_data"]["messages"][0]["content"] = "changed-content"
 
         assert (
             request_data["metadata"]["headers"]["x-noma-application-id"] == "header-app"
         )
+        # Trimming the duplicated conversation must not mutate the caller's dict either.
         assert request_data["messages"][0]["content"] == "hello"
 
     def test_build_scan_payload_survives_unpicklable_request_data(
@@ -191,14 +228,13 @@ class TestNomaV2Configuration:
 
         assert isinstance(payload["request_data"], dict)
         assert payload["request_data"]["event_loop"] == "<fake-uvloop-loop>"
-        assert payload["request_data"]["messages"] == [
-            {"role": "user", "content": "hello"}
-        ]
+        assert "messages" not in payload["request_data"]
 
         # Original request_data must not have been mutated by the copy.
         assert request_data["event_loop"] is unpicklable
+        assert request_data["messages"] == [{"role": "user", "content": "hello"}]
 
-    def test_build_scan_payload_passes_model_call_details_as_is(
+    def test_build_scan_payload_passes_model_call_details_without_conversation(
         self, noma_v2_guardrail
     ):
         class _LoggingObj:
@@ -223,9 +259,10 @@ class TestNomaV2Configuration:
             application_id="test-app",
         )
 
+        # model_call_details repeats the conversation a third time; everything else still passes
+        # through, including complete_streaming_response which the scanner reads for stream end.
         assert payload["request_data"]["litellm_logging_obj"] == {
             "model": "gpt-4.1-mini",
-            "messages": [{"role": "user", "content": "hello"}],
             "stream": False,
             "call_type": "acompletion",
             "litellm_call_id": "call-id-123",

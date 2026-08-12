@@ -160,8 +160,10 @@ class NomaV2Guardrail(CustomGuardrail):
         return payload
 
     @staticmethod
-    def _without_duplicated_conversation(data: Mapping[str, Any]) -> dict[str, Any]:  # mutable-ok: handed to _sanitize_payload_for_transport, which takes a dict
-        return {  # mutable-ok: same - the trimmed copy is the sanitizer's input
+    def _without_duplicated_conversation(
+        data: Mapping[str, Any],
+    ) -> dict[str, Any]:  # mutable-ok: fed to _sanitize_payload_for_transport, which takes a dict
+        return {  # mutable-ok: same - the sanitizer needs a real dict
             key: value for key, value in data.items() if key not in _DUPLICATED_CONVERSATION_KEYS
         }
 

@@ -620,6 +620,29 @@ def test_get_team_models_all_team_models_expands_with_access_groups():
     assert "group-2" in result
 
 
+def test_get_key_models_teamless_all_team_models_returns_unrestricted():
+    """Teamless key with all-team-models must resolve the same as leaving the
+    models field empty ([] = unrestricted). The sentinel must not leak into
+    the returned list. Fails if someone adds a team_id guard to the sentinel
+    expansion in get_key_models."""
+    from litellm.proxy._types import SpecialModelNames
+    from litellm.proxy.auth.model_checks import get_key_models
+
+    user_api_key_dict = type(
+        "obj",
+        (object,),
+        {
+            "models": [SpecialModelNames.all_team_models.value],
+            "team_id": None,
+            "team_models": [],
+        },
+    )()
+    proxy_model_list = ["gpt-4o", "claude-sonnet-4-20250514"]
+    result = get_key_models(user_api_key_dict, proxy_model_list, {})
+    assert SpecialModelNames.all_team_models.value not in result
+    assert result == [], "should return [] (unrestricted), same as an unscoped key"
+
+
 def test_expand_wildcard_deployments_non_wildcard_passthrough():
     """Non-wildcard deployments must be returned unchanged."""
     from litellm.proxy.auth.model_checks import (
@@ -686,3 +709,54 @@ def test_expand_wildcard_invalid_litellm_params_passthrough():
     # Even if LiteLLM_Params construction fails the deployment should survive
     result = expand_wildcard_deployments_for_model_info([deployment])
     assert result == [deployment]
+
+
+def test_add_known_models_refreshes_models_by_provider_for_wildcard_expansion():
+    """models_by_provider was a frozen import-time snapshot of set unions, so cost map
+    reloads (which call add_known_models) never reached wildcard expansion until a
+    process restart (LIT-4947)."""
+    import litellm
+    from litellm.proxy.auth.model_checks import get_known_models_from_wildcard
+
+    fake_model = "vertex_ai/gemini-lit4947-regression"
+    captured_reference = litellm.models_by_provider
+    assert fake_model not in litellm.models_by_provider["vertex_ai"]
+    try:
+        litellm.add_known_models(
+            model_cost_map={
+                fake_model: {"litellm_provider": "vertex_ai-language-models", "mode": "chat"}
+            }
+        )
+        assert fake_model in litellm.models_by_provider["vertex_ai"]
+        assert litellm.models_by_provider is captured_reference
+        assert fake_model in captured_reference["vertex_ai"]
+        assert fake_model in get_known_models_from_wildcard("vertex_ai/*")
+    finally:
+        litellm.vertex_language_models.discard(fake_model)
+        litellm.add_known_models(model_cost_map={})
+    assert fake_model not in litellm.models_by_provider["vertex_ai"]
+
+def test_get_complete_model_list_drops_no_default_models_sentinel():
+    from litellm.proxy.auth.model_checks import get_complete_model_list
+
+    result = get_complete_model_list(
+        key_models=["no-default-models", "model-a"],
+        team_models=[],
+        proxy_model_list=["model-a", "model-b"],
+        user_model=None,
+        infer_model_from_keys=False,
+    )
+    assert result == ["model-a"]
+
+
+def test_get_complete_model_list_sentinel_only_grants_nothing():
+    from litellm.proxy.auth.model_checks import get_complete_model_list
+
+    result = get_complete_model_list(
+        key_models=["no-default-models"],
+        team_models=["no-default-models"],
+        proxy_model_list=["model-a", "model-b"],
+        user_model=None,
+        infer_model_from_keys=False,
+    )
+    assert result == []

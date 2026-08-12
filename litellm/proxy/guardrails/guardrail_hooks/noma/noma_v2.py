@@ -7,6 +7,7 @@
 import enum
 import json
 import os
+from collections.abc import Mapping
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Final, Literal, Optional, cast
 from urllib.parse import urlparse
@@ -35,6 +36,11 @@ _DEFAULT_API_BASE: Final = "https://api.noma.security/"
 _AIDR_SCAN_ENDPOINT: Final = "/litellm/guardrail"
 _INTERVENED_INPUT_FIELDS: Final = ("texts", "images", "tools", "tool_calls")
 _DEFAULT_API_BASE_HOSTNAME: Final = urlparse(_DEFAULT_API_BASE).hostname
+
+# The conversation the scanner reads is carried by `inputs`; these keys repeat it inside
+# `request_data`, so forwarding them uploads the whole conversation - base64 images and all -
+# a second time. Everything else in `request_data` is still passed through untouched.
+_DUPLICATED_CONVERSATION_KEYS: Final = ("messages", "input")
 
 
 class _Action(str, enum.Enum):
@@ -131,9 +137,17 @@ class NomaV2Guardrail(CustomGuardrail):
         logging_obj: Optional["LiteLLMLoggingObj"],
         application_id: str | None,
     ) -> dict:
-        payload_request_data: Final = self._sanitize_payload_for_transport(request_data)
+        # Trimmed before serialization, so the duplicated conversation is never encoded at all.
+        payload_request_data: Final = self._sanitize_payload_for_transport(
+            self._without_duplicated_conversation(request_data)
+        )
         if logging_obj is not None:
-            payload_request_data["litellm_logging_obj"] = getattr(logging_obj, "model_call_details", None)
+            model_call_details: Final = getattr(logging_obj, "model_call_details", None)
+            payload_request_data["litellm_logging_obj"] = (
+                self._without_duplicated_conversation(model_call_details)
+                if isinstance(model_call_details, dict)
+                else model_call_details
+            )
 
         payload: Final[dict[str, Any]] = {
             "inputs": inputs,
@@ -144,6 +158,14 @@ class NomaV2Guardrail(CustomGuardrail):
         if application_id:
             payload["application_id"] = application_id
         return payload
+
+    @staticmethod
+    def _without_duplicated_conversation(
+        data: Mapping[str, Any],
+    ) -> dict[str, Any]:  # mutable-ok: fed to _sanitize_payload_for_transport, which takes a dict
+        return {  # mutable-ok: same - the sanitizer needs a real dict
+            key: value for key, value in data.items() if key not in _DUPLICATED_CONVERSATION_KEYS
+        }
 
     @staticmethod
     def _sanitize_payload_for_transport(payload: dict) -> dict:

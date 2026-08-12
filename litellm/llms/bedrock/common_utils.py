@@ -711,19 +711,20 @@ def bedrock_converse_supports_strict_tools(model: str) -> bool:
     """
     Whether ``toolSpec.strict`` can be forwarded to Bedrock Converse for ``model``.
 
-    Non-Anthropic Bedrock families (Nova, Llama, GPT-OSS) reject the field
-    outright. Anthropic models forward it unless their entry in
-    ``model_prices_and_context_window.json`` sets
-    ``bedrock_converse_supports_strict_tools: false`` — Bedrock routes those
-    (Opus 4.7/4.8, see #31582) through a stricter validator that rejects the
-    ``strict`` key on ``toolSpec`` even though Anthropic's native API accepts
-    it as a top-level tool field.
+    Noma fork: never. Upstream forwards ``strict`` — and the ``additionalProperties``
+    Bedrock requires alongside it — for every Anthropic model whose entry in
+    ``model_prices_and_context_window.json`` omits
+    ``bedrock_converse_supports_strict_tools: false``. That default is unsafe for us:
+    Bedrock rejects the key for models the shipped cost map does not list yet (Claude
+    Sonnet 5 is in our model_list and its fix, #35688, missed v1.96.0), and the cost
+    map is fetched from GitHub at runtime, so upstream can change our wire payload
+    without a version bump.
+
+    Returning ``False`` pins the v1.89.5 payload, which never carried ``strict``.
+    Drop this return to restore upstream behaviour once we ship a release containing
+    #35688; ``_get_bedrock_converse_strict_tools_flag`` stays wired for that.
     """
-    base = get_bedrock_base_model(model)
-    if not base.startswith("anthropic"):
-        return False
-    flag = _get_bedrock_converse_strict_tools_flag(base)
-    return flag if flag is not None else True
+    return False
 
 
 def _get_bedrock_converse_strict_tools_flag(base_model: str) -> bool | None:

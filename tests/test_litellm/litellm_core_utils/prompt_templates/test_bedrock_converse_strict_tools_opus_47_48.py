@@ -4,6 +4,11 @@ Bedrock Converse routes Claude Opus 4.7/4.8 and Claude Sonnet 4 through an
 Anthropic-compatible validator that rejects ``toolSpec.strict`` even though
 Anthropic's native API accepts ``strict`` as a top-level tool field. See
 BerriAI/litellm#31582.
+
+This fork opts out of forwarding ``strict`` for every model, so the assertions
+below expect it dropped everywhere rather than only for the models upstream
+flags in ``model_prices_and_context_window.json``. See
+``bedrock_converse_supports_strict_tools``.
 """
 
 import pytest
@@ -73,12 +78,18 @@ def test_bedrock_tools_pt_strict_dropped_for_strict_unsupported_models(
         "bedrock/us.anthropic.claude-opus-4-5",
     ],
 )
-def test_bedrock_tools_pt_strict_kept_for_other_anthropic(model_id: str) -> None:
-    """Sonnet 4.5/4.6 and Opus <=4.6 accept toolSpec.strict — keep forwarding it."""
+def test_bedrock_tools_pt_strict_dropped_for_upstream_supported_anthropic(
+    model_id: str,
+) -> None:
+    """Upstream forwards strict for these; the fork opt-out drops it everywhere."""
     result = _bedrock_tools_pt(_STRICT_TOOL, model=model_id)
+    tool_spec = result[0]["toolSpec"]
     assert (
-        result[0]["toolSpec"]["strict"] is True
-    ), f"strict missing for {model_id}: {result[0]['toolSpec']}"
+        "strict" not in tool_spec
+    ), f"strict leaked into toolSpec for {model_id}: {tool_spec}"
+    assert (
+        "additionalProperties" not in tool_spec["inputSchema"]["json"]
+    ), f"additionalProperties leaked into toolSpec for {model_id}: {tool_spec}"
 
 
 @pytest.mark.parametrize(
@@ -108,11 +119,11 @@ def test_bedrock_converse_supports_strict_tools_helper() -> None:
         bedrock_converse_supports_strict_tools(
             "anthropic.claude-sonnet-4-5-20250929-v1:0"
         )
-        is True
+        is False
     )
     assert (
         bedrock_converse_supports_strict_tools("bedrock/us.anthropic.claude-opus-4-6")
-        is True
+        is False
     )
     assert bedrock_converse_supports_strict_tools("us.amazon.nova-micro-v1:0") is False
     assert bedrock_converse_supports_strict_tools("") is False

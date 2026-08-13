@@ -117,6 +117,11 @@ VALID_METRIC_ATTRIBUTE_NAMES: frozenset[str] = frozenset(
         "gen_ai.request.model",
         "gen_ai.framework",
         "hidden_params",
+        # Lifted from requester_metadata so the blob can be exclude_list'd
+        # without losing the grouping dimensions Prometheus already exposes
+        # via custom_prometheus_metadata_labels.
+        "component",
+        "platform",
     )
     + tuple(f"metadata.{key}" for key in METRIC_METADATA_KEYS)
 )
@@ -1482,6 +1487,19 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
         hidden_params = getattr(std_log, "hidden_params", None) or (std_log or {}).get("hidden_params", {})
         if hidden_params:
             common_attrs["hidden_params"] = safe_dumps(hidden_params)
+
+        # Lift the bounded grouping fields off requester_metadata before the
+        # operator's exclude_list can drop the blob. Same idea as Prometheus
+        # custom_prometheus_metadata_labels resolving metadata.component /
+        # metadata.platform from the flattened requester_metadata dict.
+        # Without this, excluding metadata.requester_metadata (required: it
+        # embeds per-request headers/traceparent) also drops component/platform.
+        requester_metadata = md.get("requester_metadata")
+        if isinstance(requester_metadata, dict):
+            for key in ("component", "platform"):
+                value = requester_metadata.get(key)
+                if value is not None:
+                    common_attrs[key] = str(value)
 
         common_attrs = self._filter_metric_attributes(common_attrs)
 

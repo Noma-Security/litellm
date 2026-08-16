@@ -4,6 +4,7 @@
 #
 # +-------------------------------------------------------------+
 
+import asyncio
 import enum
 import json
 import os
@@ -35,6 +36,12 @@ _DEFAULT_API_BASE: Final = "https://api.noma.security/"
 _AIDR_SCAN_ENDPOINT: Final = "/litellm/guardrail"
 _INTERVENED_INPUT_FIELDS: Final = ("texts", "images", "tools", "tool_calls")
 _DEFAULT_API_BASE_HOSTNAME: Final = urlparse(_DEFAULT_API_BASE).hostname
+
+# Server-side failures are transient, Cloudflare's 520 included, and the scan is a read-only
+# classification, so replaying it is safe. httpx retries only connection setup, not status codes.
+_RETRYABLE_SCAN_STATUS_FLOOR: Final = 500
+_SCAN_MAX_ATTEMPTS: Final = 3
+_SCAN_RETRY_BASE_DELAY_SECONDS: Final = 0.5
 
 
 class _Action(str, enum.Enum):
@@ -186,23 +193,41 @@ class NomaV2Guardrail(CustomGuardrail):
 
         endpoint: Final = f"{self.api_base}{_AIDR_SCAN_ENDPOINT}"
         sanitized_payload: Final = self._sanitize_payload_for_transport(payload)
-        response: Final = await self.async_handler.post(
-            url=endpoint,
-            headers=headers,
-            json=sanitized_payload,
-        )
-        verbose_proxy_logger.debug(
-            "Noma v2 AIDR response: status_code=%s body=%s",
-            response.status_code,
-            response.text,
-        )
-        response.raise_for_status()
-        response_json: Final = response.json()
-        verbose_proxy_logger.debug(
-            "Noma v2 AIDR response parsed: %s",
-            json.dumps(response_json, default=str),
-        )
-        return response_json
+
+        for attempt in range(_SCAN_MAX_ATTEMPTS):
+            response = await self.async_handler.post(
+                url=endpoint,
+                headers=headers,
+                json=sanitized_payload,
+            )
+            verbose_proxy_logger.debug(
+                "Noma v2 AIDR response: status_code=%s body=%s",
+                response.status_code,
+                response.text,
+            )
+
+            attempts_left = attempt < _SCAN_MAX_ATTEMPTS - 1
+            if response.status_code >= _RETRYABLE_SCAN_STATUS_FLOOR and attempts_left:
+                delay = _SCAN_RETRY_BASE_DELAY_SECONDS * (2**attempt)
+                verbose_proxy_logger.warning(
+                    "Noma v2 AIDR returned %s, retrying in %ss (attempt %s of %s)",
+                    response.status_code,
+                    delay,
+                    attempt + 1,
+                    _SCAN_MAX_ATTEMPTS,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            response.raise_for_status()
+            response_json = response.json()
+            verbose_proxy_logger.debug(
+                "Noma v2 AIDR response parsed: %s",
+                json.dumps(response_json, default=str),
+            )
+            return response_json
+
+        raise RuntimeError("Noma v2 guardrail: scan retry loop ended without a response")
 
     def _add_guardrail_observability(
         self,

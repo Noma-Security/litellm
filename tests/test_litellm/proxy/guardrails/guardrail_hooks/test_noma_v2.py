@@ -655,3 +655,56 @@ class TestNomaV2ApplicationIdResolution:
 
         payload = call_mock.call_args.kwargs["payload"]
         assert "application_id" not in payload
+
+
+class TestNomaV2ScanRetries:
+    @staticmethod
+    def _response(status_code, action="NONE"):
+        response = MagicMock()
+        response.status_code = status_code
+        response.text = f'{{"action":"{action}"}}'
+        response.json.return_value = {"action": action}
+        response.raise_for_status = MagicMock()
+        return response
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [500, 502, 503, 520, 524])
+    async def test_retries_any_server_error_then_succeeds(self, noma_v2_guardrail, status_code):
+        mock_post = AsyncMock(side_effect=[self._response(status_code), self._response(200)])
+
+        with patch.object(noma_v2_guardrail.async_handler, "post", mock_post), patch(
+            "litellm.proxy.guardrails.guardrail_hooks.noma.noma_v2.asyncio.sleep",
+            new=AsyncMock(),
+        ):
+            result = await noma_v2_guardrail._call_noma_scan(payload={"inputs": {"texts": []}})
+
+        assert result == {"action": "NONE"}
+        assert mock_post.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_gives_up_after_max_attempts(self, noma_v2_guardrail):
+        exhausted = self._response(520)
+        exhausted.raise_for_status = MagicMock(side_effect=Exception("520 Origin Error"))
+        mock_post = AsyncMock(return_value=exhausted)
+
+        with patch.object(noma_v2_guardrail.async_handler, "post", mock_post), patch(
+            "litellm.proxy.guardrails.guardrail_hooks.noma.noma_v2.asyncio.sleep",
+            new=AsyncMock(),
+        ):
+            with pytest.raises(Exception, match="520 Origin Error"):
+                await noma_v2_guardrail._call_noma_scan(payload={"inputs": {"texts": []}})
+
+        assert mock_post.call_count == 3
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [400, 401, 404, 429])
+    async def test_does_not_retry_client_errors(self, noma_v2_guardrail, status_code):
+        failed = self._response(status_code)
+        failed.raise_for_status = MagicMock(side_effect=Exception(f"{status_code} Client Error"))
+        mock_post = AsyncMock(return_value=failed)
+
+        with patch.object(noma_v2_guardrail.async_handler, "post", mock_post):
+            with pytest.raises(Exception, match=f"{status_code} Client Error"):
+                await noma_v2_guardrail._call_noma_scan(payload={"inputs": {"texts": []}})
+
+        assert mock_post.call_count == 1

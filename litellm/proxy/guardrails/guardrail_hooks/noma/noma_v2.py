@@ -37,11 +37,9 @@ _AIDR_SCAN_ENDPOINT: Final = "/litellm/guardrail"
 _INTERVENED_INPUT_FIELDS: Final = ("texts", "images", "tools", "tool_calls")
 _DEFAULT_API_BASE_HOSTNAME: Final = urlparse(_DEFAULT_API_BASE).hostname
 
-# Server-side failures are transient, Cloudflare's 520 included, and the scan is a read-only
-# classification, so replaying it is safe. httpx retries only connection setup, not status codes.
 _RETRYABLE_SCAN_STATUS_FLOOR: Final = 500
 _SCAN_MAX_ATTEMPTS: Final = 3
-_SCAN_RETRY_BASE_DELAY_SECONDS: Final = 0.5
+_SCAN_RETRY_BASE_DELAY_SECONDS: Final = 0.1
 
 
 class _Action(str, enum.Enum):

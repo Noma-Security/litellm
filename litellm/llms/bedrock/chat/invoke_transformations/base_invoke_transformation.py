@@ -346,14 +346,38 @@ class AmazonInvokeConfig(BaseConfig, BaseAWSLLM):
                     api_key=api_key,
                     json_mode=json_mode,
                 )
+            elif provider == "openai":
+                return litellm.AmazonBedrockOpenAIConfig().transform_response(
+                    model=model,
+                    raw_response=raw_response,
+                    model_response=model_response,
+                    logging_obj=logging_obj,
+                    request_data=request_data,
+                    messages=messages,
+                    optional_params=optional_params,
+                    litellm_params=litellm_params,
+                    encoding=encoding,
+                    api_key=api_key,
+                    json_mode=json_mode,
+                )
             elif provider == "ai21":
                 outputText = completion_response.get("completions")[0].get("data").get("text")
             elif provider == "meta" or provider == "llama" or provider == "deepseek_r1":
                 outputText = completion_response["generation"]
             elif provider == "mistral":
                 outputText = litellm.AmazonMistralConfig.get_outputText(completion_response, model_response)
-            else:  # amazon titan
+            elif provider == "amazon":  # amazon titan
                 outputText = completion_response.get("results")[0].get("outputText")
+            else:
+                # Mirror transform_request: an unhandled provider is a routing bug,
+                # not a malformed body. Falling through to Titan's `results[0]` here
+                # reports someone else's valid response as a Bedrock error.
+                raise BedrockError(
+                    status_code=404,
+                    message=f"Bedrock Invoke HTTPX: Unknown provider={provider}, model={model}. Try calling via converse route - `bedrock/converse/<model>`.",
+                )
+        except BedrockError:
+            raise
         except Exception as e:
             raise BedrockError(
                 message=f"Error processing={raw_response.text}, Received error={e!s}",

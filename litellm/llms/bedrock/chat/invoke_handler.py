@@ -215,6 +215,13 @@ async def make_call(
                 sync_stream=False,
             )
             completion_stream = decoder.aiter_bytes(response.aiter_bytes(chunk_size=stream_chunk_size))
+        elif bedrock_invoke_provider == "openai":
+            decoder = AmazonOpenAIStreamDecoder(
+                model=model,
+                sync_stream=False,
+                json_mode=json_mode,
+            )
+            completion_stream = decoder.aiter_bytes(response.aiter_bytes(chunk_size=stream_chunk_size))
         else:
             decoder = AWSEventStreamDecoder(model=model, json_mode=json_mode)
             completion_stream = decoder.aiter_bytes(response.aiter_bytes(chunk_size=stream_chunk_size))
@@ -297,6 +304,13 @@ def make_sync_call(
             decoder = AmazonDeepSeekR1StreamDecoder(
                 model=model,
                 sync_stream=True,
+            )
+            completion_stream = decoder.iter_bytes(response.iter_bytes(chunk_size=stream_chunk_size))
+        elif bedrock_invoke_provider == "openai":
+            decoder = AmazonOpenAIStreamDecoder(
+                model=model,
+                sync_stream=True,
+                json_mode=json_mode,
             )
             completion_stream = decoder.iter_bytes(response.iter_bytes(chunk_size=stream_chunk_size))
         else:
@@ -725,6 +739,33 @@ class AmazonAnthropicClaudeStreamDecoder(AWSEventStreamDecoder):
 
     def _chunk_parser(self, chunk_data: dict) -> ModelResponseStream:
         return self.anthropic_model_response_iterator.chunk_parser(chunk=chunk_data)
+
+
+class AmazonOpenAIStreamDecoder(AWSEventStreamDecoder):
+    def __init__(
+        self,
+        model: str,
+        sync_stream: bool,
+        json_mode: bool | None = None,
+    ) -> None:
+        """
+        Bedrock's openai.* models stream OpenAI `chat.completion.chunk` payloads
+        inside the AWS event-stream frames. None of the shapes the base decoder
+        sniffs for match, so it would yield an empty delta for every chunk.
+        """
+        from litellm.llms.openai.chat.gpt_transformation import (
+            OpenAIChatCompletionStreamingHandler,
+        )
+
+        super().__init__(model=model, json_mode=json_mode)
+        self.openai_model_response_iterator = OpenAIChatCompletionStreamingHandler(
+            streaming_response=None,
+            sync_stream=sync_stream,
+            json_mode=json_mode,
+        )
+
+    def _chunk_parser(self, chunk_data: dict) -> ModelResponseStream:
+        return self.openai_model_response_iterator.chunk_parser(chunk=chunk_data)
 
 
 class AmazonDeepSeekR1StreamDecoder(AWSEventStreamDecoder):

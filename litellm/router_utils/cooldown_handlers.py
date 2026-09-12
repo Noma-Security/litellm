@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 import litellm
 from litellm._logging import verbose_router_logger
+from litellm.caching.dual_cache import DualCache
 from litellm.constants import (
     DEFAULT_COOLDOWN_TIME_SECONDS,
     DEFAULT_FAILURE_THRESHOLD_MINIMUM_REQUESTS,
@@ -259,7 +260,7 @@ def _should_run_cooldown_logic(
     litellm_router_instance: LitellmRouter,
     deployment: str | None,
     exception_status: str | int,
-    original_exception: Any,
+    original_exception: Exception,
     time_to_cooldown: float | None = None,
 ) -> bool:
     """
@@ -318,7 +319,8 @@ def _should_cooldown_deployment(
     litellm_router_instance: LitellmRouter,
     deployment: str,
     exception_status: str | int,
-    original_exception: Any,
+    original_exception: Exception,
+    requested_model_group: str | None = None,
 ) -> bool:
     """
     Helper that decides if a deployment should be put in cooldown
@@ -341,7 +343,9 @@ def _should_cooldown_deployment(
     model_group: Final = litellm_router_instance.get_model_group(id=deployment)
     is_single_deployment_model_group = False
     if model_group is not None and len(model_group) == 1:
-        is_single_deployment_model_group = True
+        is_single_deployment_model_group = not litellm_router_instance.routing_group_has_alternatives(
+            requested_model_group
+        )
 
     ## CHECK DEPLOYMENT-LEVEL POLICY FIRST (overrides router-level)
     dep_policy, dep_allowed_fails = _get_deployment_cooldown_policy(litellm_router_instance, deployment)
@@ -409,10 +413,11 @@ def _should_cooldown_deployment(
 
 def _set_cooldown_deployments(
     litellm_router_instance: LitellmRouter,
-    original_exception: Any,
+    original_exception: Exception,
     exception_status: str | int,
     deployment: str | None = None,
     time_to_cooldown: float | None = None,
+    requested_model_group: str | None = None,
 ) -> bool:
     """
     Add a model to the list of models being cooled down for that minute, if it exceeds the allowed fails / minute
@@ -449,6 +454,7 @@ def _set_cooldown_deployments(
         deployment=deployment,
         exception_status=exception_status,
         original_exception=original_exception,
+        requested_model_group=requested_model_group,
     ):
         litellm_router_instance.cooldown_cache.add_deployment_to_cooldown(
             model_id=deployment,
@@ -542,7 +548,7 @@ def _get_cooldown_deployments(litellm_router_instance: LitellmRouter, parent_ote
 def should_cooldown_based_on_allowed_fails_policy(
     litellm_router_instance: LitellmRouter,
     deployment: str,
-    original_exception: Any,
+    original_exception: Exception,
     allowed_fails_override: int | None = None,
     cooldown_time_override: float | None = None,
     cache_key_suffix: str | None = None,
@@ -553,9 +559,12 @@ def should_cooldown_based_on_allowed_fails_policy(
     When *allowed_fails_override* / *cooldown_time_override* are supplied they
     take precedence over the router-level values (used by deployment-level overrides).
 
+    The counter lives in the router's shared ``DualCache`` (Redis when configured), so
+    every worker process increments the same key and the threshold applies fleet-wide.
+
     When *cache_key_suffix* is supplied the fail counter is keyed as
-    ``{deployment}:{cache_key_suffix}`` so that different exception types are
-    tracked independently per deployment.
+    ``deployment:{deployment}:allowed_fails:{cache_key_suffix}`` so that different
+    exception types are tracked independently per deployment.
 
     Returns:
     - True if fails exceed the allowed limit (should cooldown)
@@ -579,16 +588,25 @@ def should_cooldown_based_on_allowed_fails_policy(
         else (litellm_router_instance.cooldown_time or DEFAULT_COOLDOWN_TIME_SECONDS)
     )
 
-    cache_key: Final = f"{deployment}:{cache_key_suffix}" if cache_key_suffix else deployment
-    current_fails: Final = litellm_router_instance.failed_calls.get_cache(key=cache_key) or 0
-    updated_fails: Final = current_fails + 1
+    base_key: Final = f"deployment:{deployment}:allowed_fails"
+    cache_key: Final = f"{base_key}:{cache_key_suffix}" if cache_key_suffix else base_key
+    updated_fails: Final = _increment_allowed_fails(
+        cache=litellm_router_instance.cache, cache_key=cache_key, ttl=cooldown_time
+    )
+    return updated_fails > allowed_fails
 
-    if updated_fails > allowed_fails:
-        return True
-    else:
-        litellm_router_instance.failed_calls.set_cache(key=cache_key, value=updated_fails, ttl=cooldown_time)
 
-    return False
+def _increment_allowed_fails(cache: DualCache, cache_key: str, ttl: float) -> int:
+    """
+    Return the fleet-wide fail count. ``DualCache.increment_cache`` bumps the in-memory tier
+    before Redis and re-raises a Redis error, so a Redis outage degrades to this worker's own count.
+    """
+    try:
+        return cache.increment_cache(key=cache_key, value=1, ttl=ttl)
+    except Exception as e:  # noqa: BLE001  # a Redis outage must not stop failing deployments from cooling down
+        verbose_router_logger.warning("allowed_fails counter fell back to this worker's in-memory count: %s", e)
+        local_fails: Final = cache.get_cache(key=cache_key, local_only=True)
+        return local_fails if isinstance(local_fails, int) else 0
 
 
 def _is_allowed_fails_set_on_router(

@@ -1161,3 +1161,159 @@ def test_recovery_probe_still_closes_the_breaker():
 
     assert breaker._state == breaker.CLOSED
     assert breaker.is_open() is False
+
+
+@pytest.mark.asyncio
+async def test_stale_success_during_the_recovery_probe_leaves_the_breaker_to_the_probe():
+    """A call admitted before the trip that finishes while HALF_OPEN must not close the breaker.
+
+    Only the one call designated as the recovery probe has actually reached Redis after the
+    outage, so closing on the straggler's success resumed full Redis traffic before the probe
+    had proven anything.
+    """
+    from litellm.caching.redis_cache import RedisCircuitBreaker, _run_under_circuit_breaker
+
+    breaker = RedisCircuitBreaker(failure_threshold=3, recovery_timeout=60)
+    stale_admitted = asyncio.Event()
+    stale_release = asyncio.Event()
+    probe_admitted = asyncio.Event()
+    probe_release = asyncio.Event()
+
+    async def stale_call() -> str:
+        stale_admitted.set()
+        await stale_release.wait()
+        return "stale"
+
+    async def probe_call() -> str:
+        probe_admitted.set()
+        await probe_release.wait()
+        return "probe"
+
+    stale = asyncio.ensure_future(_run_under_circuit_breaker(breaker, "op", stale_call))
+    await stale_admitted.wait()
+    for _ in range(3):
+        breaker.record_failure()
+    assert breaker._state == breaker.OPEN
+    breaker._opened_at = time.time() - 9999
+    probe = asyncio.ensure_future(_run_under_circuit_breaker(breaker, "op", probe_call))
+    await probe_admitted.wait()
+    assert breaker._state == breaker.HALF_OPEN
+
+    stale_release.set()
+    assert await stale == "stale"
+
+    assert breaker._state == breaker.HALF_OPEN, "the straggler must not close the breaker for the probe"
+    assert breaker.is_open() is True
+
+    probe_release.set()
+    assert await probe == "probe"
+
+    assert breaker._state == breaker.CLOSED
+    assert breaker.is_open() is False
+
+
+@pytest.mark.asyncio
+async def test_a_probe_overtaken_by_a_later_outage_leaves_the_breaker_to_the_new_probe():
+    """A probe still in flight when a late failure reopens the breaker must not close it for the next probe.
+
+    Once the breaker has reopened, only the probe admitted after that outage has reached
+    Redis, so the older probe's success no longer says anything about whether Redis recovered.
+    """
+    from litellm.caching.redis_cache import RedisCircuitBreaker, _run_under_circuit_breaker
+
+    breaker = RedisCircuitBreaker(failure_threshold=3, recovery_timeout=60)
+    old_probe_admitted = asyncio.Event()
+    old_probe_release = asyncio.Event()
+    new_probe_admitted = asyncio.Event()
+    new_probe_release = asyncio.Event()
+
+    async def old_probe_call() -> str:
+        old_probe_admitted.set()
+        await old_probe_release.wait()
+        return "old probe"
+
+    async def new_probe_call() -> str:
+        new_probe_admitted.set()
+        await new_probe_release.wait()
+        return "new probe"
+
+    for _ in range(3):
+        breaker.record_failure()
+    breaker._opened_at = time.time() - 9999
+    old_probe = asyncio.ensure_future(_run_under_circuit_breaker(breaker, "op", old_probe_call))
+    await old_probe_admitted.wait()
+    assert breaker._state == breaker.HALF_OPEN
+
+    breaker.record_failure()
+    assert breaker._state == breaker.OPEN
+    breaker._opened_at = time.time() - 9999
+    new_probe = asyncio.ensure_future(_run_under_circuit_breaker(breaker, "op", new_probe_call))
+    await new_probe_admitted.wait()
+    assert breaker._state == breaker.HALF_OPEN
+
+    old_probe_release.set()
+    assert await old_probe == "old probe"
+
+    assert breaker._state == breaker.HALF_OPEN, "the overtaken probe must not close the breaker for the new probe"
+    assert breaker.is_open() is True
+
+    new_probe_release.set()
+    assert await new_probe == "new probe"
+    assert breaker._state == breaker.CLOSED
+
+
+def test_timeouts_during_a_blip_log_once_per_interval_not_once_per_call(sync_batch_redis_cache, caplog, monkeypatch):
+    """A Redis latency blip must not write one ERROR line per timed-out cache call.
+
+    Before the breaker opens (up to REDIS_CIRCUIT_BREAKER_TIMEOUT_MIN_DURATION of timeouts) every
+    cache operation logged its own ERROR or WARNING line, so one single-worker proxy wrote
+    ~1100 lines in 5 s at LITELLM_LOG=WARNING. A timeout streak now logs its first failure, then
+    one summary line per REDIS_TIMEOUT_LOG_INTERVAL carrying the count of suppressed timeouts,
+    while every timeout stays visible at DEBUG. Hard connectivity failures keep their per-call line.
+    """
+    import logging
+
+    from redis.exceptions import TimeoutError as RedisTimeoutError
+
+    from litellm.caching import redis_cache as redis_cache_module
+    from litellm.caching.redis_cache import _RedisTimeoutLogThrottle
+
+    clock = MagicMock(return_value=1_000.0)
+    monkeypatch.setattr(
+        redis_cache_module, "_redis_timeout_log_throttle", _RedisTimeoutLogThrottle(interval=5.0, clock=clock)
+    )
+    sync_batch_redis_cache.redis_client.get.side_effect = RedisTimeoutError("Timeout reading from 127.0.0.1:6379")
+    sync_batch_redis_cache.redis_client.mget.side_effect = RedisTimeoutError("Timeout reading from 127.0.0.1:6379")
+
+    with caplog.at_level(logging.DEBUG, logger="LiteLLM"):
+        for _ in range(200):
+            assert sync_batch_redis_cache.get_cache("lit7520") is None
+        assert sync_batch_redis_cache.batch_get_cache(key_list=["lit7520"]) == {}
+
+    timeout_records = [r for r in caplog.records if "Timeout reading from" in r.getMessage()]
+    assert len(timeout_records) == 201, "every timeout must stay visible at DEBUG"
+    assert [r.getMessage() for r in timeout_records if r.levelno >= logging.WARNING] == [
+        "litellm.caching.caching: get() - Got exception from REDIS: Timeout reading from 127.0.0.1:6379"
+    ]
+    assert timeout_records[0].levelno == logging.ERROR
+    assert timeout_records[0].filename == "redis_cache.py"
+    assert timeout_records[0].lineno != timeout_records[-1].lineno, "the record must point at the cache operation"
+
+    caplog.clear()
+    clock.return_value += 5.0
+    with caplog.at_level(logging.DEBUG, logger="LiteLLM"):
+        assert sync_batch_redis_cache.batch_get_cache(key_list=["lit7520"]) == {}
+    assert [(r.levelno, r.getMessage()) for r in caplog.records] == [
+        (
+            logging.ERROR,
+            "Error occurred in batch get cache: Timeout reading from 127.0.0.1:6379"
+            " (200 more Redis timeouts since the previous Redis timeout line were logged at DEBUG)",
+        )
+    ]
+
+    caplog.clear()
+    sync_batch_redis_cache.redis_client.get.side_effect = OSError("redis unavailable")
+    with caplog.at_level(logging.DEBUG, logger="LiteLLM"):
+        for _ in range(3):
+            assert sync_batch_redis_cache.get_cache("lit7520") is None
+    assert [r.levelno for r in caplog.records if "redis unavailable" in r.getMessage()] == [logging.ERROR] * 3

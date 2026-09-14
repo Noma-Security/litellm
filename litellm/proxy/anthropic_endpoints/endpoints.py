@@ -24,6 +24,9 @@ from litellm.proxy.common_request_processing import (
     create_response,
 )
 from litellm.proxy.common_utils.http_parsing_utils import _read_request_body
+from litellm.types.llms.anthropic_messages.anthropic_response import (
+    AnthropicMessagesResponse,
+)
 from litellm.types.utils import TokenCountResponse
 
 router: Final = APIRouter()
@@ -137,8 +140,6 @@ async def anthropic_response(
         # Create Anthropic-formatted response with violation message
         import uuid
 
-        from litellm.types.utils import AnthropicMessagesResponse
-
         # Report the blocked LLM response's real token usage (carried on the
         # exception) instead of discarding it; zero for pre-call blocks.
         _usage: Final = _blocked_response_usage(e.original_response)
@@ -154,9 +155,13 @@ async def anthropic_response(
         )
 
         if data.get("stream", None) is not None and data["stream"] is True:
-            # For streaming, use the standard SSE data generator
+            from litellm.llms.anthropic.experimental_pass_through.messages.fake_stream_iterator import (
+                FakeAnthropicMessagesStreamIterator,
+            )
+
             async def _passthrough_stream_generator():
-                yield _anthropic_response
+                for _chunk in FakeAnthropicMessagesStreamIterator(_anthropic_response):
+                    yield _chunk
 
             selected_data_generator: Final = ProxyBaseLLMRequestProcessing.async_sse_data_generator(
                 response=_passthrough_stream_generator(),

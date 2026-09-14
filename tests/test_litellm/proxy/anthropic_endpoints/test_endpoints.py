@@ -93,8 +93,8 @@ class TestBlockedResponseUsage:
         from unittest.mock import AsyncMock, MagicMock
 
         import litellm.proxy.anthropic_endpoints.endpoints as ep
-        import litellm.proxy.proxy_server as proxy_server
         from litellm.integrations.custom_guardrail import ModifyResponseException
+        from litellm.proxy import proxy_server
 
         exc = ModifyResponseException(
             message="blocked by guardrail",
@@ -123,6 +123,62 @@ class TestBlockedResponseUsage:
         assert response["content"][0]["text"] == "blocked by guardrail"
         assert response["usage"] == {"input_tokens": 12, "output_tokens": 5}
         mock_logging.post_call_failure_hook.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_blocked_streaming_response_is_a_valid_anthropic_sse_stream(self):
+        """A passthrough block on a streaming request must emit the full Anthropic SSE
+        event sequence. Emitting the terminal message object alone parses as an empty
+        stream in the Anthropic SDK, which is what Claude Code uses."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        import litellm.proxy.anthropic_endpoints.endpoints as ep
+        from litellm.integrations.custom_guardrail import ModifyResponseException
+        from litellm.proxy import proxy_server
+
+        exc = ModifyResponseException(
+            message="blocked by guardrail",
+            model="claude-3-5-sonnet-20240620",
+            request_data={"stream": True},
+            guardrail_name="noma_v2",
+        )
+
+        with (
+            patch.object(ep, "_read_request_body", new=AsyncMock(return_value={"stream": True})),
+            patch.object(
+                ep.ProxyBaseLLMRequestProcessing,
+                "base_process_llm_request",
+                new=AsyncMock(side_effect=exc),
+            ),
+            patch.object(proxy_server, "proxy_logging_obj") as mock_logging,
+        ):
+            mock_logging.post_call_failure_hook = AsyncMock()
+
+            async def _passthrough_iterator_hook(response, **kwargs):
+                async for _chunk in response:
+                    yield _chunk
+
+            mock_logging.async_post_call_streaming_iterator_hook = _passthrough_iterator_hook
+            response = await ep.anthropic_response(
+                fastapi_response=MagicMock(),
+                request=MagicMock(),
+                user_api_key_dict=MagicMock(),
+            )
+
+        body = b""
+        async for chunk in response.body_iterator:
+            body += chunk if isinstance(chunk, bytes) else chunk.encode()
+        text = body.decode()
+
+        events = [line.split("event: ", 1)[1] for line in text.splitlines() if line.startswith("event: ")]
+        assert events == [
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ]
+        assert "blocked by guardrail" in text
 
 
 class TestEventLoggingBatchEndpoint:

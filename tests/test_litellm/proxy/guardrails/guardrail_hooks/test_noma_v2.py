@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from litellm.exceptions import ModifyResponseException
 from litellm.proxy.guardrails.guardrail_hooks.noma import NomaV2Guardrail
 from litellm.proxy.guardrails.guardrail_hooks.noma.noma import NomaBlockedMessage
 from litellm.types.proxy.guardrails.guardrail_hooks.noma import (
@@ -655,3 +656,166 @@ class TestNomaV2ApplicationIdResolution:
 
         payload = call_mock.call_args.kwargs["payload"]
         assert "application_id" not in payload
+
+
+class TestNomaV2OnFlaggedAction:
+    @staticmethod
+    def _guardrail(**overrides):
+        params = {
+            "api_key": "test-api-key",
+            "api_base": "https://api.test.noma.security/",
+            "guardrail_name": "test-noma-v2-guardrail",
+            "event_hook": "pre_call",
+            "default_on": True,
+        }
+        params.update(overrides)
+        return NomaV2Guardrail(**params)
+
+    @pytest.mark.asyncio
+    async def test_blocked_defaults_to_http_400(self):
+        """Omitting on_flagged_action must keep the pre-existing hard-block behavior."""
+        guardrail = self._guardrail()
+        with patch.object(
+            guardrail,
+            "_call_noma_scan",
+            AsyncMock(return_value={"action": "BLOCKED", "blocked_reason": "prompt injection"}),
+        ):
+            with pytest.raises(NomaBlockedMessage) as exc_info:
+                await guardrail.apply_guardrail(
+                    inputs={"texts": ["bad"]},
+                    request_data={"metadata": {}},
+                    input_type="request",
+                )
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_passthrough_raises_modify_response_with_reason(self):
+        guardrail = self._guardrail(on_flagged_action="passthrough")
+        response_json = {"action": "BLOCKED", "blocked_reason": "prompt injection"}
+        with patch.object(guardrail, "_call_noma_scan", AsyncMock(return_value=response_json)):
+            with pytest.raises(ModifyResponseException) as exc_info:
+                await guardrail.apply_guardrail(
+                    inputs={"texts": ["bad"]},
+                    request_data={"metadata": {}, "model": "gpt-4o"},
+                    input_type="request",
+                )
+
+        exc = exc_info.value
+        assert exc.message == "Request blocked by Noma guardrail: prompt injection"
+        assert exc.model == "gpt-4o"
+        assert exc.guardrail_name == "test-noma-v2-guardrail"
+        assert exc.detection_info == response_json
+
+    @pytest.mark.asyncio
+    async def test_passthrough_on_response_uses_response_wording(self):
+        guardrail = self._guardrail(on_flagged_action="passthrough")
+        with patch.object(
+            guardrail,
+            "_call_noma_scan",
+            AsyncMock(return_value={"action": "BLOCKED", "blocked_reason": "leaked secret"}),
+        ):
+            with pytest.raises(ModifyResponseException) as exc_info:
+                await guardrail.apply_guardrail(
+                    inputs={"texts": ["bad"]},
+                    request_data={"metadata": {}},
+                    input_type="response",
+                )
+        assert exc_info.value.message == "Response blocked by Noma guardrail: leaked secret"
+
+    @pytest.mark.asyncio
+    async def test_passthrough_without_reason_still_has_message(self):
+        guardrail = self._guardrail(on_flagged_action="passthrough")
+        with patch.object(guardrail, "_call_noma_scan", AsyncMock(return_value={"action": "BLOCKED"})):
+            with pytest.raises(ModifyResponseException) as exc_info:
+                await guardrail.apply_guardrail(
+                    inputs={"texts": ["bad"]},
+                    request_data={"metadata": {}},
+                    input_type="request",
+                )
+        assert exc_info.value.message == "Request blocked by Noma guardrail"
+
+    @pytest.mark.asyncio
+    async def test_monitor_lets_blocked_verdict_through_unchanged(self):
+        guardrail = self._guardrail(on_flagged_action="monitor")
+        inputs = {"texts": ["bad"]}
+        with patch.object(
+            guardrail,
+            "_call_noma_scan",
+            AsyncMock(return_value={"action": "BLOCKED", "blocked_reason": "prompt injection"}),
+        ):
+            result = await guardrail.apply_guardrail(
+                inputs=inputs,
+                request_data={"metadata": {}},
+                input_type="request",
+            )
+        assert result == inputs
+
+    @pytest.mark.asyncio
+    async def test_unknown_action_fails_closed_to_block(self):
+        guardrail = self._guardrail(on_flagged_action="ignore-everything")
+        with patch.object(guardrail, "_call_noma_scan", AsyncMock(return_value={"action": "BLOCKED"})):
+            with pytest.raises(NomaBlockedMessage):
+                await guardrail.apply_guardrail(
+                    inputs={"texts": ["bad"]},
+                    request_data={"metadata": {}},
+                    input_type="request",
+                )
+
+    def test_env_var_sets_action(self):
+        with patch.dict(os.environ, {"NOMA_ON_FLAGGED_ACTION": "passthrough"}, clear=False):
+            guardrail = self._guardrail()
+        assert guardrail.on_flagged_action.value == "passthrough"
+
+    def test_explicit_argument_overrides_env_var(self):
+        with patch.dict(os.environ, {"NOMA_ON_FLAGGED_ACTION": "passthrough"}, clear=False):
+            guardrail = self._guardrail(on_flagged_action="block")
+        assert guardrail.on_flagged_action.value == "block"
+
+    @pytest.mark.asyncio
+    async def test_passthrough_is_not_treated_as_a_guardrail_failure(self):
+        """ModifyResponseException must bypass the block_failures fail-open path,
+        otherwise a passthrough violation would be swallowed and the call would proceed."""
+        guardrail = self._guardrail(on_flagged_action="passthrough", block_failures=False)
+        with patch.object(
+            guardrail,
+            "_call_noma_scan",
+            AsyncMock(return_value={"action": "BLOCKED", "blocked_reason": "prompt injection"}),
+        ):
+            with pytest.raises(ModifyResponseException):
+                await guardrail.apply_guardrail(
+                    inputs={"texts": ["bad"]},
+                    request_data={"metadata": {}},
+                    input_type="request",
+                )
+
+
+class TestNomaV2OnFlaggedActionWiring:
+    @staticmethod
+    def _params(**overrides):
+        from litellm.types.guardrails import LitellmParams
+
+        base = {"guardrail": "noma_v2", "mode": "pre_call", "api_key": "test-api-key"}
+        base.update(overrides)
+        return LitellmParams(**base)
+
+    def test_unset_on_flagged_action_does_not_inherit_foreign_default(self):
+        """LitellmParams inherits on_flagged_action='monitor' from another provider's
+        config model. A Noma config that never set it must still block, not monitor."""
+        from litellm.proxy.guardrails.guardrail_hooks.noma import initialize_guardrail_v2
+
+        params = self._params()
+        assert params.on_flagged_action == "monitor"
+
+        guardrail = initialize_guardrail_v2(
+            litellm_params=params, guardrail={"guardrail_name": "noma-v2"}
+        )
+        assert guardrail.on_flagged_action.value == "block"
+
+    def test_explicit_passthrough_reaches_the_guardrail(self):
+        from litellm.proxy.guardrails.guardrail_hooks.noma import initialize_guardrail_v2
+
+        guardrail = initialize_guardrail_v2(
+            litellm_params=self._params(on_flagged_action="passthrough"),
+            guardrail={"guardrail_name": "noma-v2"},
+        )
+        assert guardrail.on_flagged_action.value == "passthrough"

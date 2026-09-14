@@ -47,6 +47,14 @@ class NomaV2GuardrailConfigModel(GuardrailConfigModel):
         default=None,
         description="When true, fail closed on Noma API errors.",
     )
+    on_flagged_action: str | None = Field(
+        default=None,
+        description=(
+            "What to do with a BLOCKED verdict: 'block' (HTTP 400, the default), "
+            "'passthrough' (HTTP 200 whose assistant message carries the violation), "
+            "or 'monitor' (log only). Reads NOMA_ON_FLAGGED_ACTION if None."
+        ),
+    )
 
     @staticmethod
     def ui_friendly_name() -> str:

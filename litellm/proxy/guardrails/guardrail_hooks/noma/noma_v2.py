@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal, Optional, cast
 from urllib.parse import urlparse
 
 from litellm._logging import verbose_proxy_logger
+from litellm.exceptions import ModifyResponseException
 from litellm.integrations.custom_guardrail import (
     CustomGuardrail,
     log_guardrail_information,
@@ -43,6 +44,12 @@ class _Action(str, enum.Enum):
     GUARDRAIL_INTERVENED = "GUARDRAIL_INTERVENED"
 
 
+class _OnFlaggedAction(str, enum.Enum):
+    BLOCK = "block"
+    MONITOR = "monitor"
+    PASSTHROUGH = "passthrough"
+
+
 class NomaV2Guardrail(CustomGuardrail):
     def __init__(
         self,
@@ -51,6 +58,7 @@ class NomaV2Guardrail(CustomGuardrail):
         application_id: str | None = None,
         monitor_mode: bool | None = None,
         block_failures: bool | None = None,
+        on_flagged_action: str | None = None,
         **kwargs: Any,
     ) -> None:
         self.async_handler = get_async_httpx_client(llm_provider=httpxSpecialProvider.GuardrailCallback)
@@ -67,6 +75,8 @@ class NomaV2Guardrail(CustomGuardrail):
             self.block_failures = os.environ.get("NOMA_BLOCK_FAILURES", "true").lower() == "true"
         else:
             self.block_failures = block_failures
+
+        self.on_flagged_action = self._resolve_on_flagged_action(on_flagged_action)
 
         if self._requires_api_key(api_base=self.api_base) and not self.api_key:
             raise ValueError("Noma v2 guardrail requires api_key when using Noma SaaS endpoint")
@@ -109,6 +119,53 @@ class NomaV2Guardrail(CustomGuardrail):
             return None
         stripped: Final = value.strip()
         return stripped or None
+
+    @staticmethod
+    def _resolve_on_flagged_action(value: str | None) -> _OnFlaggedAction:
+        raw: Final = NomaV2Guardrail._get_non_empty_str(value) or os.environ.get("NOMA_ON_FLAGGED_ACTION")
+        if raw is None:
+            return _OnFlaggedAction.BLOCK
+        try:
+            return _OnFlaggedAction(raw.strip().lower())
+        except ValueError:
+            verbose_proxy_logger.warning(
+                "Noma v2 guardrail: unsupported on_flagged_action %r, falling back to %r",
+                raw,
+                _OnFlaggedAction.BLOCK.value,
+            )
+            return _OnFlaggedAction.BLOCK
+
+    @staticmethod
+    def _format_violation_message(
+        response_json: dict[str, Any],
+        input_type: Literal["request", "response"],
+    ) -> str:
+        subject: Final = "Request" if input_type == "request" else "Response"
+        reason: Final = NomaV2Guardrail._get_non_empty_str(response_json.get("blocked_reason"))
+        if reason is None:
+            return f"{subject} blocked by Noma guardrail"
+        return f"{subject} blocked by Noma guardrail: {reason}"
+
+    def _build_block_outcome(
+        self,
+        response_json: dict[str, Any],
+        request_data: dict[str, Any],
+        input_type: Literal["request", "response"],
+    ) -> NomaBlockedMessage | ModifyResponseException | None:
+        """Exception to raise for a BLOCKED verdict, or None to observe it without enforcing."""
+        match self.on_flagged_action:
+            case _OnFlaggedAction.BLOCK:
+                return NomaBlockedMessage(response_json)
+            case _OnFlaggedAction.PASSTHROUGH:
+                return ModifyResponseException(
+                    message=self._format_violation_message(response_json, input_type),
+                    model=str(request_data.get("model") or "unknown"),
+                    request_data=request_data,
+                    guardrail_name=self.guardrail_name,
+                    detection_info=response_json,
+                )
+            case _OnFlaggedAction.MONITOR:
+                return None
 
     def _resolve_action_from_response(
         self,
@@ -226,11 +283,24 @@ class NomaV2Guardrail(CustomGuardrail):
     def _apply_action(
         self,
         inputs: GenericGuardrailAPIInputs,
-        response_json: dict,
+        response_json: dict[str, Any],
         action: _Action,
+        request_data: dict[str, Any],
+        input_type: Literal["request", "response"],
     ) -> GenericGuardrailAPIInputs:
         if action == _Action.BLOCKED:
-            raise NomaBlockedMessage(response_json)
+            outcome: Final = self._build_block_outcome(
+                response_json=response_json,
+                request_data=request_data,
+                input_type=input_type,
+            )
+            if outcome is not None:
+                raise outcome
+            verbose_proxy_logger.info(
+                "Noma v2 guardrail: BLOCKED verdict not enforced (on_flagged_action=monitor, input_type=%s)",
+                input_type,
+            )
+            return inputs
 
         if action == _Action.GUARDRAIL_INTERVENED:
             updated_inputs: Final = cast(GenericGuardrailAPIInputs, dict(inputs))
@@ -295,12 +365,14 @@ class NomaV2Guardrail(CustomGuardrail):
                 inputs=inputs,
                 response_json=response_json,
                 action=action,
+                request_data=request_data,
+                input_type=input_type,
             )
 
             guardrail_status = "success" if action == _Action.NONE else "guardrail_intervened"
             return processed_inputs
 
-        except NomaBlockedMessage as e:
+        except (NomaBlockedMessage, ModifyResponseException) as e:
             guardrail_status = "guardrail_intervened"
             guardrail_json_response = (
                 response_json if isinstance(response_json, dict) else getattr(e, "detail", {"error": "blocked"})

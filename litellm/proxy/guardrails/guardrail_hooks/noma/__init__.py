@@ -34,6 +34,15 @@ def initialize_guardrail(litellm_params: "LitellmParams", guardrail: "Guardrail"
     return _noma_callback
 
 
+def _explicit_on_flagged_action(litellm_params: "LitellmParams") -> str | None:
+    # LitellmParams inherits an `on_flagged_action` default of "monitor" from another
+    # provider's config model, so reading it unconditionally would silently downgrade
+    # every Noma deployment that never set it from blocking to log-only.
+    if "on_flagged_action" not in litellm_params.model_fields_set:
+        return None
+    return litellm_params.on_flagged_action
+
+
 def initialize_guardrail_v2(litellm_params: "LitellmParams", guardrail: "Guardrail"):
     import litellm
 
@@ -44,6 +53,7 @@ def initialize_guardrail_v2(litellm_params: "LitellmParams", guardrail: "Guardra
         application_id=litellm_params.application_id,
         monitor_mode=litellm_params.monitor_mode,
         block_failures=litellm_params.block_failures,
+        on_flagged_action=_explicit_on_flagged_action(litellm_params),
         event_hook=litellm_params.mode,
         default_on=litellm_params.default_on,
     )

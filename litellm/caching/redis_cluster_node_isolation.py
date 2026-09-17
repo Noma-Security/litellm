@@ -18,6 +18,21 @@ already does when one of its pooled connections errors), leaving every other nod
 connections untouched. Every other branch (MOVED, ASK, CLUSTERDOWN, slot-not-covered,
 retry-exhaustion) is unchanged from upstream, since those already carry real evidence the
 topology changed.
+
+A refused connection is separated from a read timeout, because only the timeout is the
+routine event described above. Azure Managed Redis under OSS cluster policy publishes one
+internal port per shard through ``CLUSTER SLOTS`` and promotes a replica -- listening on a
+different port -- on every failover, planned or not, so a refused connection means the
+address in the slot map stopped listening and the topology must be re-walked. redis-py 8.x
+flags the same re-walk natively for a connection error; on the pinned 5.3.1 the flag has to
+be set here, because the branch this override replaces was the only thing that set it.
+
+The re-walk also needs somewhere reachable to ask. ``NodesManager.initialize`` overwrites
+``startup_nodes`` with the addresses it just discovered, dropping the configured endpoint,
+so after a failover the client holds only the shard addresses that moved. The subclass
+re-seeds the configured addresses before every topology walk -- what redis-py's own
+``dynamic_startup_nodes=False`` does for the sync client, a parameter the async client did
+not gain until 6.2.0.
 """
 
 import asyncio
@@ -36,6 +51,9 @@ class _ClusterNodeAttrs(Protocol):
     mode; typing ``target_node`` as this Protocol at the one boundary keeps the override's
     own logic fully typed without a banned ``typing.cast``."""
 
+    host: str
+    port: int
+
     async def execute_command(
         self,
         *args: object,
@@ -46,6 +64,7 @@ class _ClusterNodeAttrs(Protocol):
 
 class _NodesManagerAttrs(Protocol):
     _moved_exception: object
+    startup_nodes: dict[str, _ClusterNodeAttrs]
 
     def get_node_from_slot(
         self, slot: int, read_from_replicas: bool, load_balancing_strategy: object
@@ -59,6 +78,8 @@ class _ClusterAttrs(Protocol):
     read_from_replicas: bool
     load_balancing_strategy: object
     nodes_manager: _NodesManagerAttrs
+    connection_kwargs: dict[str, object]
+    _initialize: bool
 
     def get_node(self, node_name: str) -> _ClusterNodeAttrs: ...
     async def _determine_slot(self, *args: object) -> int: ...
@@ -80,6 +101,9 @@ def get_litellm_async_redis_cluster_class() -> type["_AsyncRedisClusterType"]:
     submodules are cached in ``sys.modules`` after the first import.
     """
     import redis
+    from redis.asyncio.cluster import (
+        ClusterNode as _AsyncClusterNode,  # pyright: ignore[reportUnknownVariableType]  # same stale-stub gap as the import below
+    )
     from redis.asyncio.cluster import (
         RedisCluster as _BaseAsyncRedisCluster,  # pyright: ignore[reportUnknownVariableType]  # redis-py ships no resolvable stub for this class under the repo's current (stale) types-redis pin
     )
@@ -110,6 +134,28 @@ def get_litellm_async_redis_cluster_class() -> type["_AsyncRedisClusterType"]:
     class LiteLLMAsyncRedisCluster(
         _BaseAsyncRedisCluster  # pyright: ignore[reportUntypedBaseClass]  # same stale-stub gap as the import above; the base class itself is unresolvable, not this subclass's own code
     ):
+        def __init__(
+            self,
+            *args: object,
+            **kwargs: object,  # kwargs-ok: passes redis-py's constructor kwargs through untouched
+        ) -> None:
+            super().__init__(*args, **kwargs)
+            cluster: _ClusterAttrs = self
+            # Read back what redis-py built instead of keeping the caller's own ClusterNode
+            # objects: the constructor rebuilds them with connection_kwargs, so the
+            # passed-in instances carry none of the credentials or TLS settings.
+            self._litellm_configured_seeds: dict[  # mutable-ok: written once here, read on every topology walk
+                str, tuple[str, int]
+            ] = {name: (node.host, node.port) for name, node in cluster.nodes_manager.startup_nodes.items()}
+
+        async def initialize(self) -> "_AsyncRedisClusterType":
+            cluster: _ClusterAttrs = self
+            startup_nodes = cluster.nodes_manager.startup_nodes
+            for name, (host, port) in self._litellm_configured_seeds.items():
+                if name not in startup_nodes:
+                    startup_nodes[name] = _AsyncClusterNode(host, port, **cluster.connection_kwargs)
+            return await super().initialize()
+
         async def _execute_command(
             self,
             target_node: _ClusterNodeAttrs,
@@ -143,11 +189,18 @@ def get_litellm_async_redis_cluster_class() -> type["_AsyncRedisClusterType"]:
                     return await node.execute_command(*args, **kwargs)
                 except (BusyLoadingError, MaxConnectionsError):
                     raise
-                except (_RedisConnectionError, _RedisTimeoutError):
+                except _RedisTimeoutError:
                     # Reset only the node that actually failed instead of the upstream
                     # default (`await self.aclose()`, a full-cluster teardown that forces
                     # every other concurrent caller through the shared reinit lock).
                     await node.disconnect()
+                    raise
+                except _RedisConnectionError:
+                    # Unlike a read timeout, a refused connection means this address stopped
+                    # listening, so the slot map has to be re-walked. Ask for the re-walk
+                    # without the full-cluster teardown.
+                    await node.disconnect()
+                    cluster._initialize = True  # pyright: ignore[reportPrivateUsage]  # the branch this replaces set the same flag from this subclass, via aclose()
                     raise
                 except (ClusterDownError, SlotNotCoveredError):
                     await cluster.aclose()

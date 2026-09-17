@@ -513,6 +513,12 @@ def init_redis_cluster(redis_kwargs) -> redis.RedisCluster:
         new_startup_nodes.append(ClusterNode(**item))
 
     cluster_kwargs.pop("startup_nodes", None)
+    # Keep the configured endpoint queryable for later topology walks. Without this
+    # redis-py replaces it with the shard addresses it discovers, which a Redis Enterprise
+    # failover moves to new ports. The async client re-seeds them in
+    # litellm.caching.redis_cluster_node_isolation instead, having gained this parameter
+    # only in redis-py 6.2.0.
+    cluster_kwargs.setdefault("dynamic_startup_nodes", False)
     return redis.RedisCluster(startup_nodes=new_startup_nodes, **cluster_kwargs)
 
 

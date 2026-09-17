@@ -131,3 +131,58 @@ async def test_moved_error_still_triggers_reinit_after_reinitialize_steps() -> N
     assert result == b"v"
     instance.aclose.assert_awaited_once()
     assert instance.reinitialize_counter == 0
+
+
+@pytest.mark.asyncio
+async def test_connection_error_requests_a_topology_rewalk_but_a_timeout_does_not() -> None:
+    """A refused connection means the address stopped listening, so the slot map must be
+    re-walked; a read timeout says nothing about the topology and must not trigger one."""
+    for error_cls, expected_rewalk in ((RedisConnectionError, True), (RedisTimeoutError, False)):
+        target_node = _FakeClusterNode("node-a", raises=error_cls("boom"))
+        instance = _build_cluster_instance()
+        instance._initialize = False
+
+        with pytest.raises(error_cls):
+            await instance._execute_command(target_node, "GET", "k")
+
+        assert instance._initialize is expected_rewalk, error_cls.__name__
+        instance.aclose.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_configured_seed_is_restored_before_every_topology_walk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """redis-py replaces startup_nodes with the addresses it discovers, so the configured
+    endpoint is gone by the second walk -- and after a Redis Enterprise failover moves the
+    shard ports, those discovered addresses are exactly the dead ones. Re-seeding must put
+    the configured endpoint back, carrying its credentials, before every walk."""
+    from redis.asyncio.cluster import RedisCluster as _BaseCluster
+
+    seeds_seen_per_walk: list[list[str]] = []
+    reseeded_nodes: list[object] = []
+
+    async def fake_base_initialize(self: object) -> object:
+        nodes_manager = self.nodes_manager  # type: ignore[attr-defined]
+        seeds_seen_per_walk.append(sorted(nodes_manager.startup_nodes))
+        reseeded_nodes.extend(nodes_manager.startup_nodes.values())
+        # What NodesManager.initialize does: overwrite the seeds with what it discovered.
+        nodes_manager.startup_nodes = {"10.20.16.10:8500": _FakeClusterNode("10.20.16.10:8500")}
+        return self
+
+    monkeypatch.setattr(_BaseCluster, "initialize", fake_base_initialize, raising=True)
+
+    cluster_cls = get_litellm_async_redis_cluster_class()
+    instance = cluster_cls.__new__(cluster_cls)
+    instance.connection_kwargs = {"password": "sekret"}
+    instance.nodes_manager = _FakeNodesManager(node_to_return=_FakeClusterNode("seed"))
+    instance.nodes_manager.startup_nodes = {"cache.example.net:10000": _FakeClusterNode("cache.example.net:10000")}
+    instance._litellm_configured_seeds = {"cache.example.net:10000": ("cache.example.net", 10000)}
+
+    await instance.initialize()
+    await instance.initialize()
+
+    assert seeds_seen_per_walk[0] == ["cache.example.net:10000"]
+    # Without re-seeding this second walk would only see the discovered shard address.
+    assert "cache.example.net:10000" in seeds_seen_per_walk[1]
+    rebuilt = [n for n in reseeded_nodes if getattr(n, "host", None) == "cache.example.net"]
+    assert rebuilt, "configured endpoint was not rebuilt as a real ClusterNode"
+    assert rebuilt[0].connection_kwargs["password"] == "sekret"

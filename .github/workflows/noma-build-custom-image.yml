@@ -1,0 +1,96 @@
+name: Noma - Build custom image
+
+# Builds the Noma litellm proxy image and pushes it to ECR tagged with the
+# branch name (e.g. v1.102.0-custom). Replaces the previous manual
+# `docker buildx ... --push` step. Deploy is still a separate values bump +
+# canary — this workflow only builds/pushes, it does NOT sync ArgoCD.
+
+on:
+  push:
+    branches:
+      - "v*-custom"          # v1.102.0-custom, v1.99.x-custom, ...
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch/tag to build (defaults to the branch this is run from)"
+        required: false
+        type: string
+
+concurrency:
+  group: noma-build-custom-${{ inputs.ref || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write            # OIDC -> AWS role
+
+jobs:
+  build:
+    runs-on: arc-runners-prod
+    environment: prod
+    env:
+      AWS_REGION: us-east-1
+      AWS_ACCOUNT_ID: "381491951875"
+      IMAGE_NAME: litellm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve image tag (branch/tag name)
+        id: tag
+        shell: bash
+        run: echo "value=${{ inputs.ref || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::381491951875:role/github-actions-region-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+          username: AWS
+
+      - name: Build args
+        id: vars
+        shell: bash
+        run: |
+          echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "build_time=$(date '+%Y-%m-%dT%H:%M:%S')" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push (multi-arch)
+        env:
+          REGISTRY: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+          TAG: ${{ steps.tag.outputs.value }}
+          SHA_SHORT: ${{ steps.vars.outputs.sha_short }}
+          BUILD_TIME: ${{ steps.vars.outputs.build_time }}
+        shell: bash
+        run: |
+          docker buildx build \
+            --push \
+            --platform linux/amd64,linux/arm64 \
+            --file docker/Dockerfile.non_root \
+            --tag "$REGISTRY/$IMAGE_NAME:$TAG" \
+            --tag "$REGISTRY/$IMAGE_NAME:$TAG-$SHA_SHORT" \
+            --build-arg GIT_VERSION_TAG="$TAG" \
+            --build-arg GIT_VERSION_HASH="$SHA_SHORT" \
+            --build-arg BUILD_TIME="$BUILD_TIME" \
+            --cache-from type=registry,ref="$REGISTRY/$IMAGE_NAME:cache-custom" \
+            --cache-to type=registry,mode=max,image-manifest=true,oci-mediatypes=true,ref="$REGISTRY/$IMAGE_NAME:cache-custom" \
+            .
+
+      - name: Summary
+        shell: bash
+        run: |
+          echo "### Pushed \`$IMAGE_NAME:${{ steps.tag.outputs.value }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Registry: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" >> "$GITHUB_STEP_SUMMARY"
+          echo "Next: bump the tag in argo-cd/charts values-litellm.yaml and canary." >> "$GITHUB_STEP_SUMMARY"

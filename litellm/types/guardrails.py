@@ -670,7 +670,7 @@ class NomaGuardrailConfigModel(BaseModel):
     )
     gateway_name: str | None = Field(
         default=None,
-        description="noma_v2 only: name of this gateway, attached to Noma scans as a gateway_name label",
+        description="noma_v2 only: name of this gateway, used as the gateway_host label on Noma scans",
     )
     monitor_mode: bool | None = Field(
         default=None,

@@ -41,7 +41,7 @@ class NomaV2GuardrailConfigModel(GuardrailConfigModel):
     )
     gateway_name: str | None = Field(
         default=None,
-        description="Gateway name attached to Noma scans as a label. Reads from NOMA_GATEWAY_NAME env var if None.",
+        description="Gateway name, used as the gateway_host label on Noma scans. Falls back to NOMA_GATEWAY_NAME.",
     )
     monitor_mode: bool | None = Field(
         default=None,

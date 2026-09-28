@@ -668,6 +668,10 @@ class NomaGuardrailConfigModel(BaseModel):
         default=None,
         description="Application ID for Noma Security. Defaults to 'litellm' if not provided",
     )
+    gateway_name: str | None = Field(
+        default=None,
+        description="noma_v2 only: name of this gateway, attached to Noma scans as a gateway_name label",
+    )
     monitor_mode: bool | None = Field(
         default=None,
         description="If True, logs violations without blocking. Defaults to False if not provided",

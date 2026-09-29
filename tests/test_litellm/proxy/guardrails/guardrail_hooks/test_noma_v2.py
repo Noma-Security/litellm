@@ -787,6 +787,23 @@ class TestNomaV2GatewayName:
         assert payload["gateway_name"] == expected
 
     @pytest.mark.asyncio
+    async def test_positional_args_keep_their_meaning_after_gateway_name_was_added(self):
+        guardrail = NomaV2Guardrail("test-api-key", "https://self-managed.noma.local", "test-app", False, True)
+
+        payload = await _payload_sent_to_noma(guardrail)
+
+        assert payload["monitor_mode"] is False
+        assert payload["application_id"] == "test-app"
+        assert "gateway_name" not in payload
+        with patch.object(guardrail.async_handler, "post", AsyncMock(side_effect=RuntimeError("noma down"))):
+            with pytest.raises(RuntimeError, match="noma down"):
+                await guardrail.apply_guardrail(
+                    inputs={"texts": ["hello"]},
+                    request_data={"metadata": {}},
+                    input_type="request",
+                )
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("configured", [None, "", "   "])
     async def test_gateway_name_omitted_when_not_configured(self, configured):
         with patch.dict(os.environ, {"NOMA_API_KEY": "test-api-key"}, clear=True):

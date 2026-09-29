@@ -60,9 +60,9 @@ class NomaV2Guardrail(CustomGuardrail):
         api_key: str | None = None,
         api_base: str | None = None,
         application_id: str | None = None,
-        gateway_name: str | None = None,
         monitor_mode: bool | None = None,
         block_failures: bool | None = None,
+        gateway_name: str | None = None,
         **kwargs: Any,
     ) -> None:
         self.async_handler = get_async_httpx_client(llm_provider=httpxSpecialProvider.GuardrailCallback)

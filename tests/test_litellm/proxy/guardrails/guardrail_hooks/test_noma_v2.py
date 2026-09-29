@@ -39,6 +39,7 @@ class TestNomaV2Configuration:
         assert "api_key" in noma_v2_params
         assert "api_base" in noma_v2_params
         assert "application_id" in noma_v2_params
+        assert "gateway_name" in noma_v2_params
         assert "monitor_mode" in noma_v2_params
         assert "block_failures" in noma_v2_params
 
@@ -718,3 +719,101 @@ class TestNomaV2ApplicationIdResolution:
 
         payload = call_mock.call_args.kwargs["payload"]
         assert "application_id" not in payload
+
+
+async def _payload_sent_to_noma(guardrail: NomaV2Guardrail) -> dict:
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.text = '{"action":"NONE"}'
+    mock_response.json.return_value = {"action": "NONE"}
+    mock_post = AsyncMock(return_value=mock_response)
+
+    with patch.object(guardrail.async_handler, "post", mock_post):
+        await guardrail.apply_guardrail(
+            inputs={"texts": ["hello"]},
+            request_data={"metadata": {}},
+            input_type="request",
+        )
+
+    return mock_post.call_args.kwargs["json"]
+
+
+class TestNomaV2GatewayName:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("guardrail_type", "extra_params"),
+        [("noma_v2", {}), ("noma", {"use_v2": True})],
+    )
+    async def test_gateway_name_from_guardrail_config_is_sent_to_noma(self, guardrail_type, extra_params):
+        from litellm.proxy.guardrails.guardrail_hooks.noma import (
+            guardrail_initializer_registry,
+        )
+        from litellm.types.guardrails import LitellmParams
+
+        litellm_params = LitellmParams(
+            guardrail=guardrail_type,
+            mode="pre_call",
+            api_key="test-api-key",
+            gateway_name="prod-us-east",
+            **extra_params,
+        )
+        guardrail = guardrail_initializer_registry[guardrail_type](litellm_params, {"guardrail_name": "noma-guard"})
+
+        payload = await _payload_sent_to_noma(guardrail)
+
+        assert payload["gateway_name"] == "prod-us-east"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("configured", "env_value", "expected"),
+        [
+            (None, "env-gateway", "env-gateway"),
+            ("config-gateway", "env-gateway", "config-gateway"),
+            ("  config-gateway  ", None, "config-gateway"),
+        ],
+    )
+    async def test_gateway_name_resolution(self, configured, env_value, expected):
+        env = {"NOMA_API_KEY": "test-api-key"} | ({"NOMA_GATEWAY_NAME": env_value} if env_value else {})
+        with patch.dict(os.environ, env, clear=True):
+            guardrail = NomaV2Guardrail(
+                gateway_name=configured,
+                guardrail_name="test-noma-v2-guardrail",
+                event_hook="pre_call",
+                default_on=True,
+            )
+
+        payload = await _payload_sent_to_noma(guardrail)
+
+        assert payload["gateway_name"] == expected
+
+    @pytest.mark.asyncio
+    async def test_positional_args_keep_their_meaning_after_gateway_name_was_added(self):
+        guardrail = NomaV2Guardrail("test-api-key", "https://self-managed.noma.local", "test-app", False, True)
+
+        payload = await _payload_sent_to_noma(guardrail)
+
+        assert payload["monitor_mode"] is False
+        assert payload["application_id"] == "test-app"
+        assert "gateway_name" not in payload
+        with patch.object(guardrail.async_handler, "post", AsyncMock(side_effect=RuntimeError("noma down"))):
+            with pytest.raises(RuntimeError, match="noma down"):
+                await guardrail.apply_guardrail(
+                    inputs={"texts": ["hello"]},
+                    request_data={"metadata": {}},
+                    input_type="request",
+                )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("configured", [None, "", "   "])
+    async def test_gateway_name_omitted_when_not_configured(self, configured):
+        with patch.dict(os.environ, {"NOMA_API_KEY": "test-api-key"}, clear=True):
+            guardrail = NomaV2Guardrail(
+                gateway_name=configured,
+                guardrail_name="test-noma-v2-guardrail",
+                event_hook="pre_call",
+                default_on=True,
+            )
+
+        payload = await _payload_sent_to_noma(guardrail)
+
+        assert "gateway_name" not in payload

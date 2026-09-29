@@ -86,23 +86,6 @@ def test_bedrock_tools_pt_strict_dropped_for_strict_unsupported_models(
 @pytest.mark.parametrize(
     "model_id",
     [
-        "anthropic.claude-sonnet-4-5-20250929-v1:0",
-        "bedrock/us.anthropic.claude-sonnet-4-6",
-        "bedrock/us.anthropic.claude-opus-4-6",
-        "bedrock/us.anthropic.claude-opus-4-5",
-    ],
-)
-def test_bedrock_tools_pt_strict_kept_for_other_anthropic(model_id: str) -> None:
-    """Sonnet 4.5/4.6 and Opus <=4.6 accept toolSpec.strict — keep forwarding it."""
-    result = _bedrock_tools_pt(_STRICT_TOOL, model=model_id)
-    assert (
-        result[0]["toolSpec"]["strict"] is True
-    ), f"strict missing for {model_id}: {result[0]['toolSpec']}"
-
-
-@pytest.mark.parametrize(
-    "model_id",
-    [
         "bedrock/us.anthropic.claude-sonnet-5",
         "bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0",
         "anthropic.claude-sonnet-4-5-20250929-v1:0",

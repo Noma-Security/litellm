@@ -31,6 +31,7 @@ from litellm.llms.bedrock.chat.invoke_transformations.base_invoke_transformation
 from litellm.llms.bedrock.common_utils import (
     BedrockError,
     apply_bedrock_invoke_structured_output,
+    bedrock_supports_tool_search,
     ensure_bedrock_anthropic_messages_tool_names,
     get_anthropic_beta_from_headers,
     is_claude_4_5_on_bedrock,
@@ -38,6 +39,7 @@ from litellm.llms.bedrock.common_utils import (
     normalize_custom_field_on_tools,
     normalize_tool_input_schema_types_for_bedrock_invoke,
     strip_unsupported_bedrock_invoke_output_config_keys,
+    tools_without_eager_input_streaming,
 )
 from litellm.llms.bedrock.request_metadata import (
     bedrock_request_metadata_headers,
@@ -45,6 +47,7 @@ from litellm.llms.bedrock.request_metadata import (
 )
 from litellm.types.llms.anthropic import (
     ANTHROPIC_BETA_HEADER_VALUES,
+    ANTHROPIC_FINE_GRAINED_TOOL_STREAMING_BETA_HEADER,
     ANTHROPIC_TOOL_SEARCH_BETA_HEADER,
 )
 from litellm.types.llms.bedrock import BedrockInvokeAnthropicMessagesRequest
@@ -386,9 +389,10 @@ class AmazonAnthropicClaudeMessagesConfig(
         """
         Check if the model supports tool search on Bedrock.
 
-        The model map's ``supports_tool_search`` flag is authoritative when
-        ``model`` resolves to an entry that sets it; the name patterns below
-        cover ids the map cannot resolve (ARNs, unlisted regional variants).
+        The model map's ``supports_tool_search`` flag is authoritative: an exact
+        entry, or the ``claude-tool-search`` fallback rule (Claude 4.5 and newer)
+        for ids the map cannot resolve (ARNs, unlisted regional variants) and for
+        mapped entries that carry no opinion.
 
         Ref: https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool
 
@@ -398,46 +402,7 @@ class AmazonAnthropicClaudeMessagesConfig(
         Returns:
             True if the model supports tool search on Bedrock
         """
-        catalog: Final = AnthropicModelInfo._get_provider_resolved_capability(model, "supports_tool_search", "bedrock")
-        if catalog is not None:
-            return catalog
-
-        model_lower: Final = model.lower()
-
-        supported_patterns: Final = [
-            # Opus 4.5
-            "opus-4.5",
-            "opus_4.5",
-            "opus-4-5",
-            "opus_4_5",
-            # Sonnet 4.5
-            "sonnet-4.5",
-            "sonnet_4.5",
-            "sonnet-4-5",
-            "sonnet_4_5",
-            # Opus 4.6
-            "opus-4.6",
-            "opus_4.6",
-            "opus-4-6",
-            "opus_4_6",
-            # sonnet 4.6
-            "sonnet-4.6",
-            "sonnet_4.6",
-            "sonnet-4-6",
-            "sonnet_4_6",
-            # Opus 4.7
-            "opus-4.7",
-            "opus_4.7",
-            "opus-4-7",
-            "opus_4_7",
-            # Haiku 4.5
-            "haiku-4.5",
-            "haiku_4.5",
-            "haiku-4-5",
-            "haiku_4_5",
-        ]
-
-        return any(pattern in model_lower for pattern in supported_patterns)
+        return bedrock_supports_tool_search(model)
 
     def _get_tool_search_beta_header_for_bedrock(
         self,
@@ -453,7 +418,8 @@ class AmazonAnthropicClaudeMessagesConfig(
         Bedrock requires a different beta header for tool search than the
         Anthropic API when tool search is used without programmatic tool
         calling or input examples: `tool-search-tool-2025-10-19`, and only on
-        the models listed in `_supports_tool_search_on_bedrock`.
+        the models the model map flags as `supports_tool_search`
+        (`_supports_tool_search_on_bedrock`).
 
         Ref: https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool
 
@@ -560,6 +526,9 @@ class AmazonAnthropicClaudeMessagesConfig(
 
         if injected_thinking_for_clear_thinking:
             beta_set.add("interleaved-thinking-2025-05-14")
+
+        if anthropic_model_info.is_eager_input_streaming_used(tools):
+            beta_set.add(ANTHROPIC_FINE_GRAINED_TOOL_STREAMING_BETA_HEADER)
 
         self._filter_context_management_for_bedrock_invoke(
             anthropic_messages_request=anthropic_messages_request,
@@ -755,6 +724,10 @@ class AmazonAnthropicClaudeMessagesConfig(
         if filtered_betas:
             anthropic_messages_request["anthropic_beta"] = filtered_betas
 
+        outbound_tools: Final = tools_without_eager_input_streaming(anthropic_messages_request)
+        if outbound_tools is not None:
+            anthropic_messages_request["tools"] = outbound_tools
+
         remaining_output_config: Final = anthropic_messages_request.get("output_config")
         if (
             litellm.drop_params is True
@@ -786,9 +759,7 @@ class AmazonAnthropicClaudeMessagesConfig(
         aws_decoder: Final = AmazonAnthropicClaudeMessagesStreamDecoder(
             model=model,
         )
-        completion_stream: Final = aws_decoder.aiter_bytes(
-            httpx_response.aiter_bytes(chunk_size=aws_decoder.DEFAULT_CHUNK_SIZE)
-        )
+        completion_stream: Final = aws_decoder.aiter_bytes(httpx_response.aiter_bytes())
         # Convert decoded Bedrock events to Server-Sent Events expected by Anthropic clients.
         return self.bedrock_sse_wrapper(
             completion_stream=completion_stream,
@@ -935,16 +906,6 @@ class AmazonAnthropicClaudeMessagesConfig(
 
 
 class AmazonAnthropicClaudeMessagesStreamDecoder(AWSEventStreamDecoder):
-    def __init__(
-        self,
-        model: str,
-    ) -> None:
-        """
-        Iterator to return Bedrock invoke response in anthropic /messages format
-        """
-        super().__init__(model=model)
-        self.DEFAULT_CHUNK_SIZE = 1024
-
     def _chunk_parser(self, chunk_data: dict) -> GChunk | ModelResponseStream | dict:
         """
         Parse the chunk data into anthropic /messages format

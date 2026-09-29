@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from litellm.constants import DEFAULT_MAX_REDIS_BATCH_CACHE_SIZE
 from litellm.caching.dual_cache import DualCache
 from litellm.caching.in_memory_cache import InMemoryCache
 from litellm.caching.redis_cache import RedisCache, _redis_circuit_breaker_guard, _redis_circuit_breaker_guard_sync
@@ -708,12 +709,7 @@ async def test_open_breaker_keeps_async_batch_read_memory_hits_and_releases_rese
 
 @pytest.mark.asyncio
 async def test_redis_timeouts_falling_back_to_memory_log_once_per_interval(caplog, monkeypatch):
-    """The in-memory fallback WARNING must not repeat for every timed-out increment during a blip.
-
-    The rate limiter's pipeline increments and the dual cache increments each logged a WARNING per
-    call while Redis timed out, hundreds of lines per second before the breaker opened. The first
-    timeout of a streak keeps its WARNING, the rest are DEBUG until the summary interval passes.
-    """
+    """The first fallback WARNING of a timeout streak logs, the rest stay at DEBUG until the summary."""
     from redis.exceptions import TimeoutError as RedisTimeoutError
 
     from litellm.caching import redis_cache as redis_cache_module
@@ -731,7 +727,10 @@ async def test_redis_timeouts_falling_back_to_memory_log_once_per_interval(caplo
         async def async_increment(self, key, value, **kwargs):
             raise RedisTimeoutError("Timeout reading from 127.0.0.1:6379")
 
-    cache = DualCache(in_memory_cache=InMemoryCache(), redis_cache=_TimingOutRedis())  # pyright: ignore[reportArgumentType]  # duck-typed Redis double
+    cache = DualCache(
+        in_memory_cache=InMemoryCache(),
+        redis_cache=_TimingOutRedis(),  # pyright: ignore[reportArgumentType]  # duck-typed Redis double
+    )
     increments = [RedisPipelineIncrementOperation(key="k", increment_value=1.0, ttl=60)]
 
     with caplog.at_level(logging.DEBUG, logger="LiteLLM"):
@@ -761,3 +760,34 @@ async def test_redis_timeouts_falling_back_to_memory_log_once_per_interval(caplo
             " (199 more Redis timeouts since the previous Redis timeout line were logged at DEBUG)",
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_async_delete_cache_keys_drops_memory_and_chunks_redis():
+    """Batch delete clears both layers, and chunks Redis so one caller's large
+    key list cannot become a single oversized DELETE command."""
+    redis_cache = MagicMock(spec=RedisCache)
+    redis_cache.delete_cache_keys = AsyncMock()
+    dual_cache = DualCache(in_memory_cache=InMemoryCache(), redis_cache=redis_cache)
+    keys = [f"key-{i}" for i in range(DEFAULT_MAX_REDIS_BATCH_CACHE_SIZE + 7)]
+    for key in keys:
+        dual_cache.in_memory_cache.set_cache(key=key, value=1)
+
+    await dual_cache.async_delete_cache_keys(keys)
+
+    assert all(dual_cache.in_memory_cache.get_cache(key=key) is None for key in keys)
+    sent = [call.args[0] for call in redis_cache.delete_cache_keys.await_args_list]
+    assert [len(chunk) for chunk in sent] == [DEFAULT_MAX_REDIS_BATCH_CACHE_SIZE, 7]
+    assert [key for chunk in sent for key in chunk] == keys
+
+
+@pytest.mark.asyncio
+async def test_async_delete_cache_keys_on_empty_list_touches_no_backend():
+    """An empty page must not reach Redis: DELETE with no arguments is an error."""
+    redis_cache = MagicMock(spec=RedisCache)
+    redis_cache.delete_cache_keys = AsyncMock()
+    dual_cache = DualCache(in_memory_cache=InMemoryCache(), redis_cache=redis_cache)
+
+    await dual_cache.async_delete_cache_keys([])
+
+    redis_cache.delete_cache_keys.assert_not_awaited()

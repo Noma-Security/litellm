@@ -9,7 +9,6 @@ never closed, because litellm does not own its lifecycle.
 
 import asyncio
 import gc
-import weakref
 
 import httpx
 import pytest
@@ -201,23 +200,68 @@ async def test_values_with_nothing_to_close_are_never_queued():
 
 
 @pytest.mark.asyncio
-async def test_a_queued_client_is_not_kept_alive_by_the_queue():
-    """Waiting out a grace window must not retain what the collector would free first."""
+async def test_a_queued_client_the_collector_would_reclaim_is_still_closed():
+    """An SDK client is a reference cycle the collector frees before the grace window ends.
+
+    Left to the collector, its aiohttp session is finalized unclosed, which is what
+    logged "Unclosed client session" hourly and preceded the proxy freezes.
+    """
     clock = FakeClock()
     closer = make_closer(clock)
-    client = AsyncClient()
-    gone = weakref.ref(client)
+    closed: list[bool] = []
 
+    class CyclicClient(AsyncClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.self_ref = self
+
+        async def close(self) -> None:
+            closed.append(True)
+
+    client = CyclicClient()
     closer.mark_owned(client)
     closer.schedule(client)
     del client
     gc.collect()
 
-    assert gone() is None, "the pending queue is holding the client alive"
+    clock.advance(61.0)
+    closer.reap()
+    await asyncio.sleep(0.05)
+
+    assert closed == [True]
+    assert closer.pending_count == 0
+
+
+@pytest.mark.asyncio
+async def test_a_client_on_a_shared_session_is_closed_despite_other_clients_traffic():
+    """A shared session's leases belong to every client on it, so they cannot keep one open."""
+    clock = FakeClock()
+    closer = make_closer(clock)
+
+    class Connector:
+        def __init__(self) -> None:
+            self._acquired = {object()}
+
+    class SharedSession:
+        connector = Connector()
+
+    class Transport:
+        _owns_session = False
+        client = SharedSession()
+
+    class SdkClient(AsyncClient):
+        class _client:
+            _transport = Transport()
+
+    client = SdkClient()
+    closer.mark_owned(client)
+    closer.schedule(client)
 
     clock.advance(61.0)
     closer.reap()
-    assert closer.pending_count == 0
+    await asyncio.sleep(0.05)
+
+    assert client.closed is True
 
 
 def test_sync_client_evicted_outside_an_event_loop_is_still_closed():
@@ -281,7 +325,7 @@ async def test_a_client_evicted_on_another_event_loop_is_left_alone():
     await asyncio.sleep(0.05)
 
     assert client.closed is False
-    assert closer.pending_count == 1
+    assert closer.pending_count == 0, "its loop is closed, so nothing can close it any more"
 
 
 @pytest.mark.asyncio

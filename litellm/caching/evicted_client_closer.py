@@ -29,8 +29,11 @@ it does not belong to. Queued clients are therefore bucketed by what it takes to
 close them, and each bucket is ordered by deadline, so a reap walks the entries
 that are due rather than the whole queue.
 
-The queue holds its clients weakly, so waiting out a grace window never keeps
-alive anything the collector would have reclaimed first.
+The queue holds its clients strongly. An SDK client is a reference cycle that a
+generational collection reclaims within minutes, long before the grace window
+ends, and a client the collector takes first is never closed: its aiohttp
+session is finalized by the garbage collector instead, unclosed. An entry whose
+event loop has been closed can no longer be closed, so it is dropped.
 """
 
 import asyncio
@@ -59,15 +62,13 @@ _BucketKey = str | int
 class _PendingClose:
     """A queued close.
 
-    The client is held weakly, so queueing one never keeps alive anything the
-    collector would otherwise have reclaimed first.
-
     ``needs_loop`` is set for a client whose close is a coroutine; those can only
     be closed from the event loop they were evicted on, recorded in ``loop_id``.
     A client that closes synchronously carries neither constraint.
     """
 
-    client_ref: "weakref.ref[object]"
+    client: object
+    loop_ref: "weakref.ref[asyncio.AbstractEventLoop] | None"
     loop_id: int | None
     needs_loop: bool
     close_after: float
@@ -82,11 +83,23 @@ def _bucket_key(pending: _PendingClose) -> _BucketKey:
     return pending.loop_id
 
 
-def _running_loop_id() -> int | None:
+def _running_loop() -> asyncio.AbstractEventLoop | None:
     try:
-        return id(asyncio.get_running_loop())
+        return asyncio.get_running_loop()
     except RuntimeError:
         return None
+
+
+def _running_loop_id() -> int | None:
+    loop: Final = _running_loop()
+    return None if loop is None else id(loop)
+
+
+def _loop_is_gone(pending: _PendingClose) -> bool:
+    if pending.loop_ref is None:
+        return False
+    loop: Final = pending.loop_ref()
+    return loop is None or loop.is_closed()
 
 
 def _close_function(client: object) -> Callable[[], object] | None:
@@ -140,6 +153,8 @@ def _has_connection_in_flight(client: object) -> bool:
         pooled_busy: Final = _pool_has_busy_connection(transport)
         if pooled_busy is not None:
             return pooled_busy
+        if not getattr(transport, "_owns_session", True):
+            return False  # a shared session's leases belong to every client on it
         session: Final[object] = getattr(transport, "client", None)
         return bool(getattr(getattr(session, "connector", None), "_acquired", None))
     except Exception:  # noqa: BLE001 - a client that cannot report its state is treated as idle
@@ -197,10 +212,12 @@ class EvictedClientCloser:
             return
         if self._pending_count >= self._max_pending:
             return
+        loop: Final = _running_loop()
         self._enqueue(
             _PendingClose(
-                client_ref=weakref.ref(client),
-                loop_id=_running_loop_id(),
+                client=client,
+                loop_ref=None if loop is None else weakref.ref(loop),
+                loop_id=None if loop is None else id(loop),
                 needs_loop=inspect.iscoroutinefunction(close_fn),
                 close_after=self._clock() + self._grace_seconds,
             )
@@ -216,9 +233,7 @@ class EvictedClientCloser:
             return
         now: Final = self._clock()
         for pending in self._take_due(_running_loop_id(), now):
-            client = pending.client_ref()
-            if client is None:
-                continue
+            client = pending.client
             if _has_connection_in_flight(client):
                 self._enqueue(replace(pending, close_after=now + self._grace_seconds))
                 continue
@@ -229,15 +244,14 @@ class EvictedClientCloser:
         return self._pending_count
 
     def _enqueue(self, pending: _PendingClose) -> None:
-        """Append to the entry's bucket, dropping any dead entries it queues behind.
+        """Append to the entry's bucket, dropping entries whose loop has closed.
 
         Deadlines only ever move forward, so appending keeps each bucket ordered
-        by deadline, and entries whose client the collector already took sit at
-        the front rather than having to be searched for.
+        by deadline.
         """
         with self._queue_lock:
             bucket: Final = self._buckets.setdefault(_bucket_key(pending), deque())  # mutable-ok: FIFO by design
-            while bucket and bucket[0].client_ref() is None:
+            while bucket and _loop_is_gone(bucket[0]):
                 bucket.popleft()
                 self._pending_count -= 1
             bucket.append(pending)
@@ -246,7 +260,13 @@ class EvictedClientCloser:
     def _take_due(self, loop_id: int | None, now: float) -> tuple[_PendingClose, ...]:
         buckets = (_CLOSABLE_ANYWHERE,) if loop_id is None else (_CLOSABLE_ANYWHERE, _CLOSABLE_ON_ANY_LOOP, loop_id)
         with self._queue_lock:
+            self._drop_buckets_of_closed_loops_locked()
             return tuple(pending for key in buckets for pending in self._drain_locked(key, now))
+
+    def _drop_buckets_of_closed_loops_locked(self) -> None:
+        """A loop's bucket is never drained once that loop is closed, so release it."""
+        for key in [k for k, b in self._buckets.items() if b and _loop_is_gone(b[0])]:
+            self._pending_count -= len(self._buckets.pop(key))
 
     def _drain_locked(self, key: _BucketKey, now: float) -> Iterator[_PendingClose]:
         bucket: Final = self._buckets.get(key)

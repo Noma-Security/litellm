@@ -1,14 +1,9 @@
 name: Noma - Build custom image
 
-# Builds the Noma litellm proxy image and pushes it to ECR tagged with the
-# branch name (e.g. v1.102.0-custom). Replaces the previous manual
-# `docker buildx ... --push` step. Deploy is still a separate values bump +
-# canary — this workflow only builds/pushes, it does NOT sync ArgoCD.
-
 on:
   push:
     branches:
-      - "v*-custom"          # v1.102.0-custom, v1.99.x-custom, ...
+      - "v*-custom*"
   workflow_dispatch:
     inputs:
       ref:
@@ -22,40 +17,61 @@ concurrency:
 
 permissions:
   contents: read
-  id-token: write            # OIDC -> AWS role
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: "381491951875"
+  AWS_ROLE_ARN: arn:aws:iam::381491951875:role/runners-cross-account-iam-assumable-role
+  ACR_LOGIN_SERVER: nomasecurity.azurecr.io
+  AZURE_CLIENT_ID: d583e3a5-7bb6-4623-b0b8-0d3525d68175
+  AZURE_TENANT_ID: 65d3ab99-e5b1-4ad6-b3de-e78b3637b72f
+  IMAGE_NAME: litellm
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    environment: prod
-    env:
-      AWS_REGION: us-east-1
-      AWS_ACCOUNT_ID: "381491951875"
-      IMAGE_NAME: litellm
+    name: Build ${{ matrix.arch }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: arc-runners-prod
+          - arch: arm64
+            runner: arc-runners-arm-prod
+    runs-on: ${{ matrix.runner }}
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
+      sha_short: ${{ steps.vars.outputs.sha_short }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref || github.ref_name }}
-          fetch-depth: 0
           persist-credentials: false
 
-      - name: Resolve image tag (branch/tag name)
-        id: tag
-        shell: bash
-        run: echo "value=${{ inputs.ref || github.ref_name }}" >> "$GITHUB_OUTPUT"
+      - name: Resolve tag and build args
+        id: vars
+        env:
+          REF: ${{ inputs.ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$REF" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::$REF is not a valid image tag"
+            exit 1
+          fi
+          {
+            echo "tag=$REF"
+            echo "sha_short=$(git rev-parse --short HEAD)"
+            echo "build_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Set up QEMU (arm64 emulation on the GitHub-hosted runner)
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Configure AWS credentials (OIDC)
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:
-          role-to-assume: arn:aws:iam::381491951875:role/github-actions-region-deploy
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+          role-chaining: true
+          role-skip-session-tagging: true
 
       - name: Login to Amazon ECR
         uses: docker/login-action@v4
@@ -63,37 +79,98 @@ jobs:
           registry: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
           username: AWS
 
-      - name: Build args
-        id: vars
-        shell: bash
-        run: |
-          echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-          echo "build_time=$(date '+%Y-%m-%dT%H:%M:%S')" >> "$GITHUB_OUTPUT"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
 
-      - name: Build and push (multi-arch)
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
         env:
-          REGISTRY: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
-          TAG: ${{ steps.tag.outputs.value }}
-          SHA_SHORT: ${{ steps.vars.outputs.sha_short }}
-          BUILD_TIME: ${{ steps.vars.outputs.build_time }}
-        shell: bash
-        run: |
-          docker buildx build \
-            --push \
-            --platform linux/amd64,linux/arm64 \
-            --file docker/Dockerfile.non_root \
-            --tag "$REGISTRY/$IMAGE_NAME:$TAG" \
-            --tag "$REGISTRY/$IMAGE_NAME:$TAG-$SHA_SHORT" \
-            --build-arg GIT_VERSION_TAG="$TAG" \
-            --build-arg GIT_VERSION_HASH="$SHA_SHORT" \
-            --build-arg BUILD_TIME="$BUILD_TIME" \
-            --cache-from type=registry,ref="$REGISTRY/$IMAGE_NAME:cache-custom" \
-            --cache-to type=registry,mode=max,image-manifest=true,oci-mediatypes=true,ref="$REGISTRY/$IMAGE_NAME:cache-custom" \
-            .
+          DOCKER_BUILD_SUMMARY: false
+        with:
+          context: .
+          file: docker/Dockerfile.non_root
+          platforms: linux/${{ matrix.arch }}
+          tags: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.IMAGE_NAME }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=registry,ref=${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.IMAGE_NAME }}:cache-custom-${{ matrix.arch }}
+          cache-to: type=registry,mode=max,image-manifest=true,oci-mediatypes=true,ref=${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.IMAGE_NAME }}:cache-custom-${{ matrix.arch }}
+          build-args: |
+            GIT_VERSION_TAG=${{ steps.vars.outputs.tag }}
+            GIT_VERSION_HASH=${{ steps.vars.outputs.sha_short }}
+            BUILD_TIME=${{ steps.vars.outputs.build_time }}
 
-      - name: Summary
-        shell: bash
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          echo "### Pushed \`$IMAGE_NAME:${{ steps.tag.outputs.value }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "Registry: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" >> "$GITHUB_STEP_SUMMARY"
-          echo "Next: bump the tag in argo-cd/charts values-litellm.yaml and canary." >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v6
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish to ECR and ACR
+    needs: build
+    runs-on: arc-runners-prod
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v7
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-chaining: true
+          role-skip-session-tagging: true
+
+      - name: Login to Amazon ECR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+          username: AWS
+
+      - name: Login to Azure ACR
+        uses: Noma-Security/github-actions/azure-acr-login@main
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          acr-login-server: ${{ env.ACR_LOGIN_SERVER }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Create manifest list in ECR and copy to ACR
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          ECR_REPO: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.IMAGE_NAME }}
+          ACR_REPO: ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}
+          TAG: ${{ needs.build.outputs.tag }}
+          SHA_SHORT: ${{ needs.build.outputs.sha_short }}
+        run: |
+          set -euo pipefail
+          sources=()
+          for digest in *; do
+            sources+=("$ECR_REPO@sha256:$digest")
+          done
+          docker buildx imagetools create -t "$ECR_REPO:$TAG" -t "$ECR_REPO:$TAG-$SHA_SHORT" "${sources[@]}"
+          for tag in "$TAG" "$TAG-$SHA_SHORT"; do
+            regctl image copy "$ECR_REPO:$tag" "$ACR_REPO:$tag"
+          done
+          {
+            echo "### Pushed \`$IMAGE_NAME:$TAG\` and \`$IMAGE_NAME:$TAG-$SHA_SHORT\`"
+            echo "- $ECR_REPO"
+            echo "- $ACR_REPO"
+            echo "Next: bump the tag in argo-cd values-litellm.yaml and canary."
+          } >> "$GITHUB_STEP_SUMMARY"

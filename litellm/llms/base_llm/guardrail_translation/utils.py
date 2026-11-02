@@ -442,3 +442,16 @@ class UnappliableRequestRewrite(Exception):
 
 def unappliable_request_rewrite(guardrail_name: str | None) -> UnappliableRequestRewrite:
     return UnappliableRequestRewrite(guardrail_name or "unknown")
+
+
+class UnappliableResponseRewrite(Exception):
+    def __init__(self, guardrail_name: str) -> None:
+        super().__init__(
+            f"Guardrail '{guardrail_name}' rewrote the response in a way this endpoint cannot apply, "
+            "so the response was rejected rather than returned unrewritten"
+        )
+        self.guardrail_name: Final = guardrail_name
+
+
+def unappliable_response_rewrite(guardrail_name: str | None) -> UnappliableResponseRewrite:
+    return UnappliableResponseRewrite(guardrail_name or "unknown")

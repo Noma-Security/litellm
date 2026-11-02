@@ -2856,6 +2856,115 @@ class TestAnthropicMessagesTopLevelSystemAndToolUseInputs:
         assert data["messages"][2]["content"][0]["content"] == "fetched [BLOCKED] page"
 
 
+class TestAnthropicMessagesOutputToolUseInputs:
+    """A guardrail's rewritten ``tool_calls`` on the response side land in the ``tool_use``
+    blocks they were read from, the way the request side writes prior-turn tool calls back."""
+
+    @staticmethod
+    def _tool_use_response() -> dict[str, Any]:
+        return {
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-5",
+            "content": [
+                {"type": "text", "text": "Running the check with POISON."},
+                {
+                    "type": "tool_use",
+                    "id": "toolu_01",
+                    "name": "Bash",
+                    "input": {"cmd": "AWS_ACCESS_KEY_ID=POISON aws sts get-caller-identity"},
+                },
+            ],
+            "stop_reason": "tool_use",
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("return_copies", [False, True])
+    async def test_masked_tool_call_arguments_write_back_into_the_tool_use_input(self, return_copies: bool):
+        guardrail = ToolCallArgumentsMaskingGuardrail(return_copies=return_copies)
+        response = self._tool_use_response()
+
+        await AnthropicMessagesHandler().process_output_response(
+            response=response, guardrail_to_apply=guardrail, litellm_logging_obj=MagicMock()
+        )
+
+        assert [tool_call["function"]["name"] for tool_call in guardrail.seen_tool_calls] == ["Bash"]
+        assert response["content"][0] == {"type": "text", "text": "Running the check with [BLOCKED]."}
+        assert response["content"][1] == {
+            "type": "tool_use",
+            "id": "toolu_01",
+            "name": "Bash",
+            "input": {"cmd": "AWS_ACCESS_KEY_ID=[BLOCKED] aws sts get-caller-identity"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_masked_tool_call_arguments_write_back_into_a_pydantic_tool_use_block(self):
+        from litellm.types.llms.anthropic import AnthropicResponseContentBlockToolUse
+
+        block = AnthropicResponseContentBlockToolUse(
+            type="tool_use",
+            id="toolu_01",
+            name="Bash",
+            input={"cmd": "AWS_ACCESS_KEY_ID=POISON aws sts get-caller-identity"},
+        )
+        response = {**self._tool_use_response(), "content": [block]}
+
+        await AnthropicMessagesHandler().process_output_response(
+            response=response, guardrail_to_apply=ToolCallArgumentsMaskingGuardrail(), litellm_logging_obj=MagicMock()
+        )
+
+        assert block.input == {"cmd": "AWS_ACCESS_KEY_ID=[BLOCKED] aws sts get-caller-identity"}
+        assert (block.id, block.name) == ("toolu_01", "Bash")
+
+    @pytest.mark.asyncio
+    async def test_a_guardrail_that_leaves_tool_calls_alone_leaves_the_tool_use_input_alone(self):
+        guardrail = InputsRecordingGuardrail()
+        response = self._tool_use_response()
+        tool_use_input = response["content"][1]["input"]
+
+        await AnthropicMessagesHandler().process_output_response(
+            response=response, guardrail_to_apply=guardrail, litellm_logging_obj=MagicMock()
+        )
+
+        assert guardrail.captured_inputs is not None
+        assert [tool_call["id"] for tool_call in guardrail.captured_inputs.get("tool_calls") or []] == ["toolu_01"]
+        assert response["content"][1]["input"] is tool_use_input
+
+    @pytest.mark.asyncio
+    async def test_a_returned_list_of_another_length_leaves_the_tool_use_input_alone(self):
+        class DroppingGuardrail(InputsRecordingGuardrail):
+            async def apply_guardrail(self, inputs, request_data, input_type, logging_obj=None):
+                outputs = await super().apply_guardrail(inputs, request_data, input_type, logging_obj)
+                outputs["tool_calls"] = []
+                return outputs
+
+        response = self._tool_use_response()
+        original = json.loads(json.dumps(response))
+
+        await AnthropicMessagesHandler().process_output_response(
+            response=response, guardrail_to_apply=DroppingGuardrail(), litellm_logging_obj=MagicMock()
+        )
+
+        assert response["content"][1] == original["content"][1]
+
+    @pytest.mark.asyncio
+    async def test_non_json_rewritten_arguments_reject_the_response_untouched(self):
+        from litellm.llms.base_llm.guardrail_translation.utils import UnappliableResponseRewrite
+
+        guardrail = ToolCallArgumentsMaskingGuardrail(replacement_arguments="[REDACTED]")
+        response = self._tool_use_response()
+        original = json.loads(json.dumps(response))
+
+        with pytest.raises(UnappliableResponseRewrite) as excinfo:
+            await AnthropicMessagesHandler().process_output_response(
+                response=response, guardrail_to_apply=guardrail, litellm_logging_obj=MagicMock()
+            )
+
+        assert excinfo.value.guardrail_name == "scan-only-capture"
+        assert response == original, "a rejected rewrite must leave the response untouched"
+
+
 class TestStructuredWriteBackKeepsToolResults:
     """A guardrail rewrite must never leave a tool_use without its tool_result (Claude Code ToolSearch, LIT-6103)."""
 

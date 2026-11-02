@@ -59,6 +59,7 @@ from litellm.llms.base_llm.guardrail_translation.utils import (
     stream_item_field,
     stream_item_fingerprint,
     unappliable_request_rewrite,
+    unappliable_response_rewrite,
 )
 from litellm.types.llms.anthropic import (
     ANTHROPIC_SERVER_TOOL_USE_ID_PREFIX,
@@ -152,6 +153,12 @@ class _ModelDumpBlock(Protocol):
 @runtime_checkable
 class _TextAttrBlock(Protocol):
     text: str
+
+
+@runtime_checkable
+class _ToolUseAttrBlock(Protocol):
+    name: str
+    input: Mapping[str, object]
 
 
 @runtime_checkable
@@ -450,6 +457,20 @@ def _write_back_tool_use(
     block["input"] = rewritten_input
     if shape.name is not None and shape.name != block.get("name"):
         block["name"] = shape.name
+
+
+def _write_back_output_tool_use(
+    response_content: Sequence[object], index: int, shape: _ToolCallShape, rewritten_input: Mapping[str, object]
+) -> None:
+    block: Final = _content_block_at(response_content, index)
+    if isinstance(block, _WritableMessage):
+        block["input"] = rewritten_input
+        if shape.name is not None and shape.name != block.get("name"):
+            block["name"] = shape.name
+    elif isinstance(block, _ToolUseAttrBlock):
+        block.input = dict(rewritten_input)
+        if shape.name is not None and shape.name != block.name:
+            block.name = shape.name
 
 
 def _streamed_query_strings(
@@ -1416,6 +1437,41 @@ class AnthropicMessagesHandler(BaseTranslation):
         for item, after, rewritten_input in applicable:
             _write_back_tool_use(messages[item.target.msg_idx], item.target, after, rewritten_input)
 
+    @staticmethod
+    def _apply_guardrail_tool_calls_to_output(
+        response_content: Sequence[object],
+        tool_calls_to_check: Sequence[ChatCompletionToolCallChunk],
+        pre_guardrail_tool_calls: tuple[_ToolCallShape, ...],
+        returned_tool_calls: Sequence[object] | None,
+        guardrail_name: str | None,
+    ) -> None:
+        """Write rewritten tool-call arguments and names back into the ``tool_use``
+        blocks they were read from (each chunk's ``index`` is its block's), the way
+        the request side writes prior-turn tool calls back. A rewrite that is not a
+        JSON object cannot become a ``tool_use`` input, so the response is rejected
+        before any block is touched rather than returned unrewritten."""
+        post_guardrail_tool_calls: Final = _tool_call_shapes(
+            returned_tool_calls
+            if returned_tool_calls is not None and len(returned_tool_calls) == len(pre_guardrail_tool_calls)
+            else tool_calls_to_check
+        )
+        rewritten: Final = tuple(
+            (tool_call["index"], after, _rewritten_tool_use_input(after.arguments))
+            for tool_call, before, after in zip(
+                tool_calls_to_check, pre_guardrail_tool_calls, post_guardrail_tool_calls
+            )
+            if before != after
+        )
+        applicable: Final = tuple(
+            (index, after, rewritten_input)
+            for index, after, rewritten_input in rewritten
+            if rewritten_input is not None
+        )
+        if len(applicable) != len(rewritten):
+            raise unappliable_response_rewrite(guardrail_name)
+        for index, after, rewritten_input in applicable:
+            _write_back_output_tool_use(response_content, index, after, rewritten_input)
+
     async def process_output_response(
         self,
         response: "AnthropicMessagesResponse",
@@ -1484,6 +1540,7 @@ class AnthropicMessagesHandler(BaseTranslation):
                 tool_calls_to_check,
                 response,
             )
+            pre_guardrail_tool_calls: Final = _tool_call_shapes(tool_calls_to_check)
 
             guardrailed_inputs: Final = await guardrail_to_apply.apply_guardrail(
                 inputs=inputs,
@@ -1497,6 +1554,13 @@ class AnthropicMessagesHandler(BaseTranslation):
             )
 
             # Step 3: Map guardrail responses back to original response structure
+            self._apply_guardrail_tool_calls_to_output(
+                response_content,
+                tool_calls_to_check,
+                pre_guardrail_tool_calls,
+                guardrailed_inputs.get("tool_calls"),
+                guardrail_to_apply.guardrail_name,
+            )
             await self._apply_guardrail_responses_to_output(
                 response=response,
                 responses=list(reply_rewrites),

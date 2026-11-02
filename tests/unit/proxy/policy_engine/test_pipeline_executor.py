@@ -20,7 +20,7 @@ from litellm.caching.dual_cache import DualCache
 from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.llms.anthropic.chat.guardrail_translation.handler import AnthropicMessagesHandler
-from litellm.llms.base_llm.guardrail_translation.utils import UnappliableRequestRewrite
+from litellm.llms.base_llm.guardrail_translation.utils import UnappliableRequestRewrite, UnappliableResponseRewrite
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.guardrails.guardrail_hooks.custom_code.custom_code_guardrail import (
     CustomCodeGuardrail,
@@ -1758,6 +1758,20 @@ async def test_streaming_step_blocks_with_the_legacy_hook_exception(monkeypatch)
     assert result.terminal_action == "block"
     assert [step.outcome for step in result.step_results] == ["fail"]
     assert result.original_exception is exc
+    assert chunks == [_chunk()]
+
+
+@pytest.mark.asyncio
+async def test_streaming_step_blocks_on_an_unappliable_response_rewrite_whatever_on_error_says(monkeypatch):
+    chunks = [_chunk()]
+
+    result = await _run_legacy_streaming_step(
+        monkeypatch, _LegacyHookGuardrail(raises=UnappliableResponseRewrite("masker")), chunks, on_error="allow"
+    )
+
+    assert result.terminal_action == "block"
+    assert result.step_results[0].action_taken == "block"
+    assert isinstance(result.original_exception, UnappliableResponseRewrite)
     assert chunks == [_chunk()]
 
 

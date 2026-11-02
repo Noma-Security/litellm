@@ -26,7 +26,7 @@ from litellm.litellm_core_utils.core_helpers import (
     get_or_create_metadata_bucket,
     independent_snapshot,
 )
-from litellm.llms.base_llm.guardrail_translation.utils import UnappliableRequestRewrite
+from litellm.llms.base_llm.guardrail_translation.utils import UnappliableRequestRewrite, UnappliableResponseRewrite
 from litellm.proxy.common_utils.callback_utils import add_guardrail_to_applied_guardrails_header
 from litellm.proxy.guardrails.guardrail_hooks.unified_guardrail.unified_guardrail import (
     UnifiedLLMGuardrails,
@@ -803,7 +803,7 @@ def _pipeline_action_for_step(step: PipelineStep, outcome: str, original_excepti
     cannot apply, whatever on_fail and on_error say, else the action configured for
     the outcome.
     """
-    if isinstance(original_exception, UnappliableRequestRewrite):
+    if isinstance(original_exception, (UnappliableRequestRewrite, UnappliableResponseRewrite)):
         return "block"
     return _pipeline_action_for_outcome(step, outcome)
 

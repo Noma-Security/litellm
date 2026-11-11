@@ -1482,7 +1482,7 @@ class UnifiedLLMGuardrails(CustomLogger):
                     and not chunks_yielded
                     and type(endpoint_translation).delivers_ended_stream_rewrites
                 )
-                rewrite_delivery: Final[dict[str, bool]] = (
+                rewrite_delivery: Final[Mapping[str, bool]] = (
                     {"deliver_ended_stream_rewrites": True} if delivers_rewrites else {}
                 )
                 try:

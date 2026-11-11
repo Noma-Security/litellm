@@ -38,7 +38,7 @@ if TYPE_CHECKING:
 
 
 _DEFAULT_API_BASE: Final = "https://api.noma.security/"
-_DEFAULT_SCAN_TIMEOUT_SECONDS: Final = 10.0
+_DEFAULT_SCAN_TIMEOUT_SECONDS: Final = 25.0
 """Upper bound on one Noma scan when no ``timeout`` is configured, so a slow Noma fails open instead of stalling
 the request for the shared HTTP client's much longer timeout."""
 _AIDR_SCAN_ENDPOINT: Final = "/litellm/guardrail"

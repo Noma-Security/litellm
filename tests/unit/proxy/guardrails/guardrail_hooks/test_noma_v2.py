@@ -70,11 +70,11 @@ class TestNomaV2Configuration:
 
         assert guardrail.block_failures is True
 
-    def test_init_defaults_scan_timeout_to_ten_seconds(self):
+    def test_init_defaults_scan_timeout_to_twenty_five_seconds(self):
         with patch.dict(os.environ, {"NOMA_API_KEY": "test-api-key"}, clear=True):
             guardrail = NomaV2Guardrail()
 
-        assert guardrail.timeout == 10.0
+        assert guardrail.timeout == 25.0
 
     def test_init_reads_scan_timeout_from_env(self):
         with patch.dict(os.environ, {"NOMA_API_KEY": "test-api-key", "NOMA_TIMEOUT": "2.5"}, clear=True):
@@ -87,7 +87,7 @@ class TestNomaV2Configuration:
         with patch.dict(os.environ, {"NOMA_API_KEY": "test-api-key", "NOMA_TIMEOUT": configured}, clear=True):
             guardrail = NomaV2Guardrail()
 
-        assert guardrail.timeout == 10.0
+        assert guardrail.timeout == 25.0
 
     def test_init_configured_timeout_wins_over_default(self):
         with patch.dict(os.environ, {"NOMA_API_KEY": "test-api-key", "NOMA_TIMEOUT": "2.5"}, clear=True):
@@ -586,7 +586,7 @@ class TestNomaV2ActionBehavior:
             )
 
         assert result == inputs
-        assert post.await_args.kwargs["timeout"] == 10.0
+        assert post.await_args.kwargs["timeout"] == 25.0
 
     @pytest.mark.asyncio
     async def test_a_scan_cancelled_before_noma_answers_is_recorded_as_not_run(self, noma_v2_guardrail):

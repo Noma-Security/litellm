@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Final, Protocol, TypeAlias, cast, runtime
 import anyio
 from fastapi import HTTPException
 from pydantic import TypeAdapter
+from typing_extensions import ReadOnly, TypedDict
 
 from litellm._logging import verbose_proxy_logger
 from litellm.caching.caching import DualCache
@@ -54,6 +55,10 @@ GUARDRAIL_NAME: Final = "unified_llm_guardrails"
 _DECODED_JSON: Final = TypeAdapter(object)
 
 _RequestData: TypeAlias = dict[str, object]
+
+
+class _RewriteDelivery(TypedDict, total=False):
+    deliver_ended_stream_rewrites: ReadOnly[bool]
 
 
 @runtime_checkable
@@ -1140,6 +1145,7 @@ class UnifiedLLMGuardrails(CustomLogger):
         # Local import avoids a module-level cyclic import with
         # litellm.integrations.custom_guardrail.
         from litellm.integrations.custom_guardrail import ModifyResponseException
+        from litellm.proxy.policy_engine.pipeline_executor import UndeliverableStreamRewrite
 
         if guardrail_to_apply is None:
             guardrail_to_apply = request_data.pop("guardrail_to_apply", None)
@@ -1475,6 +1481,15 @@ class UnifiedLLMGuardrails(CustomLogger):
                         yield pending_item
                     return
 
+                delivers_rewrites: Final = (
+                    buffered_items is not None
+                    and end_of_stream_only
+                    and not chunks_yielded
+                    and type(endpoint_translation).delivers_ended_stream_rewrites
+                )
+                rewrite_delivery: Final[_RewriteDelivery] = (
+                    {"deliver_ended_stream_rewrites": True} if delivers_rewrites else {}
+                )
                 try:
                     with anyio.CancelScope(shield=chunks_yielded):
                         if pending_scan is not None:
@@ -1485,8 +1500,9 @@ class UnifiedLLMGuardrails(CustomLogger):
                             litellm_logging_obj=request_data.get("litellm_logging_obj"),
                             user_api_key_dict=user_api_key_dict,
                             request_data=request_data,
+                            **rewrite_delivery,
                         )
-                    # Moderation passed: release the withheld original chunks.
+                    # Moderation passed: release the withheld chunks, rewritten in place when delivers_rewrites.
                     if buffered_items is not None:
                         for buffered_item in buffered_items:
                             yield buffered_item
@@ -1508,9 +1524,11 @@ class UnifiedLLMGuardrails(CustomLogger):
                     ):
                         yield block_chunk
                     return
-                except HTTPException as e:
+                except (UndeliverableStreamRewrite, HTTPException) as e:
+                    if isinstance(e, UndeliverableStreamRewrite):
+                        verbose_proxy_logger.warning("UnifiedLLMGuardrails: %s, failing the stream closed", e)
                     async for error_item in self.emit_streaming_http_error(
-                        e,
+                        e if isinstance(e, HTTPException) else HTTPException(status_code=500, detail={"error": str(e)}),
                         call_type,
                         responses_so_far,
                         request_data,

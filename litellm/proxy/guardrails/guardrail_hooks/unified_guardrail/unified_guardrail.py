@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Final, Protocol, TypeAlias, cast, runtime
 import anyio
 from fastapi import HTTPException
 from pydantic import TypeAdapter
+from typing_extensions import ReadOnly, TypedDict
 
 from litellm._logging import verbose_proxy_logger
 from litellm.caching.caching import DualCache
@@ -54,6 +55,10 @@ GUARDRAIL_NAME: Final = "unified_llm_guardrails"
 _DECODED_JSON: Final = TypeAdapter(object)
 
 _RequestData: TypeAlias = dict[str, object]
+
+
+class _RewriteDelivery(TypedDict, total=False):
+    deliver_ended_stream_rewrites: ReadOnly[bool]
 
 
 @runtime_checkable
@@ -1482,7 +1487,7 @@ class UnifiedLLMGuardrails(CustomLogger):
                     and not chunks_yielded
                     and type(endpoint_translation).delivers_ended_stream_rewrites
                 )
-                rewrite_delivery: Final[Mapping[str, bool]] = (
+                rewrite_delivery: Final[_RewriteDelivery] = (
                     {"deliver_ended_stream_rewrites": True} if delivers_rewrites else {}
                 )
                 try:

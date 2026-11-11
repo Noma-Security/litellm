@@ -38,6 +38,9 @@ if TYPE_CHECKING:
 
 
 _DEFAULT_API_BASE: Final = "https://api.noma.security/"
+_DEFAULT_SCAN_TIMEOUT_SECONDS: Final = 10.0
+"""Upper bound on one Noma scan when no ``timeout`` is configured, so a slow Noma fails open instead of stalling
+the request for the shared HTTP client's much longer timeout."""
 _AIDR_SCAN_ENDPOINT: Final = "/litellm/guardrail"
 _INTERVENED_INPUT_FIELDS: Final = ("texts", "images", "tools", "tool_calls")
 _DEFAULT_API_BASE_HOSTNAME: Final = urlparse(_DEFAULT_API_BASE).hostname
@@ -97,7 +100,7 @@ class NomaV2Guardrail(CustomGuardrail):
             self.monitor_mode = monitor_mode
 
         if block_failures is None:
-            self.block_failures = os.environ.get("NOMA_BLOCK_FAILURES", "true").lower() == "true"
+            self.block_failures = os.environ.get("NOMA_BLOCK_FAILURES", "false").lower() == "true"
         else:
             self.block_failures = block_failures
 
@@ -127,6 +130,26 @@ class NomaV2Guardrail(CustomGuardrail):
             **kwargs,
         }
         super().__init__(**options)
+        if self.timeout is None:
+            self.timeout = self._get_default_scan_timeout()
+
+    @staticmethod
+    def _get_default_scan_timeout() -> float:
+        configured: Final = os.environ.get("NOMA_TIMEOUT")
+        if configured:
+            try:
+                seconds: Final = float(configured)
+            except ValueError:
+                verbose_proxy_logger.warning(
+                    "Noma v2 guardrail: ignoring NOMA_TIMEOUT=%r, not a number of seconds", configured
+                )
+            else:
+                if seconds > 0:
+                    return seconds
+                verbose_proxy_logger.warning(
+                    "Noma v2 guardrail: ignoring NOMA_TIMEOUT=%r, must be greater than 0", configured
+                )
+        return _DEFAULT_SCAN_TIMEOUT_SECONDS
 
     @staticmethod
     def get_config_model() -> type["GuardrailConfigModel"] | None:

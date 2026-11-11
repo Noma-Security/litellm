@@ -62,7 +62,38 @@ class TestNomaV2Configuration:
             guardrail = NomaV2Guardrail()
 
         assert guardrail.monitor_mode is False
+        assert guardrail.block_failures is False
+
+    def test_init_block_failures_env_opts_into_fail_closed(self):
+        with patch.dict(os.environ, {"NOMA_API_KEY": "test-api-key", "NOMA_BLOCK_FAILURES": "true"}, clear=True):
+            guardrail = NomaV2Guardrail()
+
         assert guardrail.block_failures is True
+
+    def test_init_defaults_scan_timeout_to_ten_seconds(self):
+        with patch.dict(os.environ, {"NOMA_API_KEY": "test-api-key"}, clear=True):
+            guardrail = NomaV2Guardrail()
+
+        assert guardrail.timeout == 10.0
+
+    def test_init_reads_scan_timeout_from_env(self):
+        with patch.dict(os.environ, {"NOMA_API_KEY": "test-api-key", "NOMA_TIMEOUT": "2.5"}, clear=True):
+            guardrail = NomaV2Guardrail()
+
+        assert guardrail.timeout == 2.5
+
+    @pytest.mark.parametrize("configured", ["soon", "0", "-1"])
+    def test_init_ignores_invalid_scan_timeout_env(self, configured):
+        with patch.dict(os.environ, {"NOMA_API_KEY": "test-api-key", "NOMA_TIMEOUT": configured}, clear=True):
+            guardrail = NomaV2Guardrail()
+
+        assert guardrail.timeout == 10.0
+
+    def test_init_configured_timeout_wins_over_default(self):
+        with patch.dict(os.environ, {"NOMA_API_KEY": "test-api-key", "NOMA_TIMEOUT": "2.5"}, clear=True):
+            guardrail = NomaV2Guardrail(timeout=30.0)
+
+        assert guardrail.timeout == 30.0
 
     @pytest.mark.asyncio
     async def test_api_key_auth_path(self, noma_v2_guardrail):
@@ -534,6 +565,28 @@ class TestNomaV2ActionBehavior:
             )
 
         assert result == inputs
+
+    @pytest.mark.asyncio
+    async def test_default_guardrail_fails_open_when_noma_times_out(self):
+        import httpx
+
+        with patch.dict(os.environ, {"NOMA_API_KEY": "test-api-key"}, clear=True):
+            guardrail = NomaV2Guardrail(
+                guardrail_name="test-noma-v2-guardrail",
+                event_hook="pre_call",
+                default_on=True,
+            )
+        inputs = {"texts": ["hello"]}
+        post = AsyncMock(side_effect=httpx.ReadTimeout("timed out"))
+        with patch.object(guardrail.async_handler, "post", post):
+            result = await guardrail.apply_guardrail(
+                inputs=inputs,
+                request_data={"metadata": {}},
+                input_type="request",
+            )
+
+        assert result == inputs
+        assert post.await_args.kwargs["timeout"] == 10.0
 
     @pytest.mark.asyncio
     async def test_a_scan_cancelled_before_noma_answers_is_recorded_as_not_run(self, noma_v2_guardrail):

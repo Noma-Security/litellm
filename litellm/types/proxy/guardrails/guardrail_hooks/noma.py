@@ -61,7 +61,7 @@ class NomaV2GuardrailConfigModel(GuardrailConfigModel):
     )
     block_failures: bool | None = Field(
         default=None,
-        description="When true, fail closed on Noma API errors.",
+        description="When true, fail closed on Noma API errors and timeouts. Defaults to false (fail open). Falls back to NOMA_BLOCK_FAILURES.",
     )
 
     @staticmethod

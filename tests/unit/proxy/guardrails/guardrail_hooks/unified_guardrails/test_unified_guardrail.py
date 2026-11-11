@@ -3293,16 +3293,26 @@ async def test_pass_through_guardrail_text_is_the_client_body_without_the_inject
     assert data["litellm_metadata"]["user_api_key_user_email"] == "someone@example.com", data["litellm_metadata"]
 
 
-class _SecretMaskingGuardrail(_ScanCountingGuardrail):
+class _SecretMaskingGuardrail(CustomGuardrail):
+    def __init__(self, *, sampling_rate: int = 5, buffer_until_moderated: bool = False) -> None:
+        super().__init__(guardrail_name="secret-masker")
+        self.streaming_sampling_rate = sampling_rate
+        self.streaming_buffer_until_moderated = buffer_until_moderated
+        self.scanned_texts: tuple[tuple[str, ...], ...] = ()
+
+    def should_run_guardrail(self, data: dict[str, object], event_type: GuardrailEventHooks) -> bool:
+        return True
+
     async def apply_guardrail(
         self,
         inputs: GenericGuardrailAPIInputs,
         request_data: dict[str, object],
         input_type: Literal["request", "response"],
-        **kwargs: object,
+        logging_obj: object = None,
     ) -> GenericGuardrailAPIInputs:
-        recorded: Final = await super().apply_guardrail(inputs, request_data, input_type, **kwargs)
-        return {**recorded, "texts": [text.replace("SECRET-123", "[MASKED]") for text in recorded.get("texts") or []]}
+        texts: Final = tuple(inputs.get("texts") or ())
+        self.scanned_texts = (*self.scanned_texts, texts)
+        return {**inputs, "texts": [text.replace("SECRET-123", "[MASKED]") for text in texts]}
 
 
 class TestBufferedStreamDeliversMaskedText:
@@ -3322,7 +3332,7 @@ class TestBufferedStreamDeliversMaskedText:
         out: Final = await _drive_stream(UnifiedLLMGuardrails(), guardrail, chunks)
 
         assert "".join(_delta_text(item) for item in out) == "my key is [MASKED], keep it"
-        assert len(guardrail.scans) == 1, guardrail.scans
+        assert len(guardrail.scanned_texts) == 1, guardrail.scanned_texts
 
     @pytest.mark.asyncio
     async def test_live_chat_stream_is_unchanged_because_its_chunks_are_already_sent(self) -> None:

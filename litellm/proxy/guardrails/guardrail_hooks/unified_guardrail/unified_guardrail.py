@@ -1482,27 +1482,21 @@ class UnifiedLLMGuardrails(CustomLogger):
                     and not chunks_yielded
                     and type(endpoint_translation).delivers_ended_stream_rewrites
                 )
+                rewrite_delivery: Final[dict[str, bool]] = (
+                    {"deliver_ended_stream_rewrites": True} if delivers_rewrites else {}
+                )
                 try:
                     with anyio.CancelScope(shield=chunks_yielded):
                         if pending_scan is not None:
                             pending_scan.result()  # a failed background scan raises into the handlers below
-                        if delivers_rewrites:
-                            await endpoint_translation.process_output_streaming_response(
-                                responses_so_far=responses_so_far,
-                                guardrail_to_apply=guardrail_to_apply,
-                                litellm_logging_obj=request_data.get("litellm_logging_obj"),
-                                user_api_key_dict=user_api_key_dict,
-                                request_data=request_data,
-                                deliver_ended_stream_rewrites=True,
-                            )
-                        else:
-                            await endpoint_translation.process_output_streaming_response(
-                                responses_so_far=responses_so_far,
-                                guardrail_to_apply=guardrail_to_apply,
-                                litellm_logging_obj=request_data.get("litellm_logging_obj"),
-                                user_api_key_dict=user_api_key_dict,
-                                request_data=request_data,
-                            )
+                        await endpoint_translation.process_output_streaming_response(
+                            responses_so_far=responses_so_far,
+                            guardrail_to_apply=guardrail_to_apply,
+                            litellm_logging_obj=request_data.get("litellm_logging_obj"),
+                            user_api_key_dict=user_api_key_dict,
+                            request_data=request_data,
+                            **rewrite_delivery,
+                        )
                     # Moderation passed: release the withheld chunks, rewritten in place when delivers_rewrites.
                     if buffered_items is not None:
                         for buffered_item in buffered_items:
@@ -1525,21 +1519,11 @@ class UnifiedLLMGuardrails(CustomLogger):
                     ):
                         yield block_chunk
                     return
-                except UndeliverableStreamRewrite as undeliverable:
-                    verbose_proxy_logger.warning("UnifiedLLMGuardrails: %s, failing the stream closed", undeliverable)
+                except (UndeliverableStreamRewrite, HTTPException) as e:
+                    if isinstance(e, UndeliverableStreamRewrite):
+                        verbose_proxy_logger.warning("UnifiedLLMGuardrails: %s, failing the stream closed", e)
                     async for error_item in self.emit_streaming_http_error(
-                        HTTPException(status_code=500, detail={"error": str(undeliverable)}),
-                        call_type,
-                        responses_so_far,
-                        request_data,
-                        endpoint_translation=endpoint_translation,
-                        stream_started=bool(responses_yielded),
-                        responses_yielded=responses_yielded,
-                    ):
-                        yield error_item
-                except HTTPException as e:
-                    async for error_item in self.emit_streaming_http_error(
-                        e,
+                        e if isinstance(e, HTTPException) else HTTPException(status_code=500, detail={"error": str(e)}),
                         call_type,
                         responses_so_far,
                         request_data,

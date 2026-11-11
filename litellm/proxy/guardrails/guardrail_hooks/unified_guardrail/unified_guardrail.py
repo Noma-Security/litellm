@@ -1140,6 +1140,7 @@ class UnifiedLLMGuardrails(CustomLogger):
         # Local import avoids a module-level cyclic import with
         # litellm.integrations.custom_guardrail.
         from litellm.integrations.custom_guardrail import ModifyResponseException
+        from litellm.proxy.policy_engine.pipeline_executor import UndeliverableStreamRewrite
 
         if guardrail_to_apply is None:
             guardrail_to_apply = request_data.pop("guardrail_to_apply", None)
@@ -1475,18 +1476,34 @@ class UnifiedLLMGuardrails(CustomLogger):
                         yield pending_item
                     return
 
+                delivers_rewrites: Final = (
+                    buffered_items is not None
+                    and end_of_stream_only
+                    and not chunks_yielded
+                    and type(endpoint_translation).delivers_ended_stream_rewrites
+                )
                 try:
                     with anyio.CancelScope(shield=chunks_yielded):
                         if pending_scan is not None:
                             pending_scan.result()  # a failed background scan raises into the handlers below
-                        await endpoint_translation.process_output_streaming_response(
-                            responses_so_far=responses_so_far,
-                            guardrail_to_apply=guardrail_to_apply,
-                            litellm_logging_obj=request_data.get("litellm_logging_obj"),
-                            user_api_key_dict=user_api_key_dict,
-                            request_data=request_data,
-                        )
-                    # Moderation passed: release the withheld original chunks.
+                        if delivers_rewrites:
+                            await endpoint_translation.process_output_streaming_response(
+                                responses_so_far=responses_so_far,
+                                guardrail_to_apply=guardrail_to_apply,
+                                litellm_logging_obj=request_data.get("litellm_logging_obj"),
+                                user_api_key_dict=user_api_key_dict,
+                                request_data=request_data,
+                                deliver_ended_stream_rewrites=True,
+                            )
+                        else:
+                            await endpoint_translation.process_output_streaming_response(
+                                responses_so_far=responses_so_far,
+                                guardrail_to_apply=guardrail_to_apply,
+                                litellm_logging_obj=request_data.get("litellm_logging_obj"),
+                                user_api_key_dict=user_api_key_dict,
+                                request_data=request_data,
+                            )
+                    # Moderation passed: release the withheld chunks, rewritten in place when delivers_rewrites.
                     if buffered_items is not None:
                         for buffered_item in buffered_items:
                             yield buffered_item
@@ -1508,6 +1525,18 @@ class UnifiedLLMGuardrails(CustomLogger):
                     ):
                         yield block_chunk
                     return
+                except UndeliverableStreamRewrite as undeliverable:
+                    verbose_proxy_logger.warning("UnifiedLLMGuardrails: %s, failing the stream closed", undeliverable)
+                    async for error_item in self.emit_streaming_http_error(
+                        HTTPException(status_code=500, detail={"error": str(undeliverable)}),
+                        call_type,
+                        responses_so_far,
+                        request_data,
+                        endpoint_translation=endpoint_translation,
+                        stream_started=bool(responses_yielded),
+                        responses_yielded=responses_yielded,
+                    ):
+                        yield error_item
                 except HTTPException as e:
                     async for error_item in self.emit_streaming_http_error(
                         e,

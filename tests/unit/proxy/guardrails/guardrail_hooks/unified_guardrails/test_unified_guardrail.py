@@ -3342,3 +3342,54 @@ async def test_moderation_hook_lets_responses_compact_through_without_a_translat
 
     assert result is data
     assert guardrail.apply_calls == []
+
+
+class _SecretMaskingGuardrail(CustomGuardrail):
+    def __init__(self, *, sampling_rate: int = 5, buffer_until_moderated: bool = False) -> None:
+        super().__init__(guardrail_name="secret-masker")
+        self.streaming_sampling_rate = sampling_rate
+        self.streaming_buffer_until_moderated = buffer_until_moderated
+        self.scanned_texts: tuple[tuple[str, ...], ...] = ()
+
+    def should_run_guardrail(self, data: dict[str, object], event_type: GuardrailEventHooks) -> bool:
+        return True
+
+    async def apply_guardrail(
+        self,
+        inputs: GenericGuardrailAPIInputs,
+        request_data: dict[str, object],
+        input_type: Literal["request", "response"],
+        logging_obj: object = None,
+    ) -> GenericGuardrailAPIInputs:
+        texts: Final = tuple(inputs.get("texts") or ())
+        self.scanned_texts = (*self.scanned_texts, texts)
+        return {**inputs, "texts": [text.replace("SECRET-123", "[MASKED]") for text in texts]}
+
+
+class TestBufferedStreamDeliversMaskedText:
+    @pytest.fixture(autouse=True)
+    def _use_real_mappings(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_translation_mappings(monkeypatch, load_guardrail_translation_mappings())
+
+    @pytest.mark.asyncio
+    async def test_buffered_chat_stream_releases_the_masked_text(self) -> None:
+        guardrail: Final = _SecretMaskingGuardrail(buffer_until_moderated=True)
+        chunks: Final = [
+            _stream_chunk("my key is "),
+            _stream_chunk("SECRET-123"),
+            _stream_chunk(", keep it", finish_reason="stop"),
+        ]
+
+        out: Final = await _drive_stream(UnifiedLLMGuardrails(), guardrail, chunks)
+
+        assert "".join(_delta_text(item) for item in out) == "my key is [MASKED], keep it"
+        assert len(guardrail.scanned_texts) == 1, guardrail.scanned_texts
+
+    @pytest.mark.asyncio
+    async def test_live_chat_stream_is_unchanged_because_its_chunks_are_already_sent(self) -> None:
+        guardrail: Final = _SecretMaskingGuardrail(sampling_rate=1)
+        chunks: Final = [_stream_chunk("my key is "), _stream_chunk("SECRET-123", finish_reason="stop")]
+
+        out: Final = await _drive_stream(UnifiedLLMGuardrails(), guardrail, chunks)
+
+        assert "".join(_delta_text(item) for item in out) == "my key is SECRET-123"

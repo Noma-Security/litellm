@@ -81,6 +81,7 @@ COPY litellm-proxy-extras/pyproject.toml litellm-proxy-extras/
 # Install third-party dependencies (cached unless pyproject.toml/uv.lock change)
 RUN --mount=type=cache,target=/app/.cache/uv,id=litellm-uv-cache \
     uv sync --frozen --no-install-project --no-install-workspace --no-default-groups --no-editable \
+    --no-install-package litellm-enterprise \
     --extra proxy \
     --extra proxy-runtime \
     --extra extra_proxy \
@@ -109,6 +110,7 @@ RUN mkdir -p /var/lib/litellm/ui /var/lib/litellm/assets && \
 RUN --mount=type=cache,target=/app/.cache/uv,id=litellm-uv-cache \
     if [ "$PROXY_EXTRAS_SOURCE" = "published" ]; then \
       uv sync --frozen --no-default-groups --no-editable \
+        --no-install-package litellm-enterprise \
         --extra proxy \
         --extra proxy-runtime \
         --extra extra_proxy \
@@ -119,6 +121,7 @@ RUN --mount=type=cache,target=/app/.cache/uv,id=litellm-uv-cache \
         --no-sources-package litellm-proxy-extras; \
     else \
       uv sync --frozen --no-default-groups --no-editable \
+        --no-install-package litellm-enterprise \
         --extra proxy \
         --extra proxy-runtime \
         --extra extra_proxy \
@@ -156,10 +159,6 @@ COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/docker /app/docker
 COPY --from=builder /app/schema.prisma /app/schema.prisma
 COPY --from=builder /app/litellm/proxy/prisma_migration.py /app/litellm/proxy/prisma_migration.py
-# enterprise/ is imported by source path at runtime (proxy_cli puts the
-# working directory on sys.path; litellm/proxy/hooks resolves
-# enterprise.enterprise_hooks from it)
-COPY --from=builder /app/enterprise /app/enterprise
 COPY --from=builder /app/litellm-proxy-extras /app/litellm-proxy-extras
 # Prisma CLI + engines are baked under /opt/prisma, a fixed path every runtime
 # uid can read and that no cache volume mount shadows (unlike /app/.cache or
